@@ -1,0 +1,18 @@
+# 编译产物
+out/
+*.o
+*.s
+*.dll
+*.exe
+
+# 日志
+*.log
+*.txt
+
+# 系统
+Thumbs.db
+.DS_Store
+.vscode/
+.idea/
+.gitcommitmsg.tmp
+*.tmp
