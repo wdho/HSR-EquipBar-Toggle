@@ -10,7 +10,7 @@ local function uid(value)
   error("unsupported equipment UID")
 end
 
-function M.read(bridge,equipTr,requireDragIdle)
+function M.read(bridge,equipTr,requireDragState)
   local client=bridge.RPG.Client
   local page=client.GlobalVars.s_UIManager:GetPageByName("GridFightPreparationPage")
   local pageData=page and page.LuaTable
@@ -22,9 +22,12 @@ function M.read(bridge,equipTr,requireDragIdle)
   if root==nil or root.gameObject:GetInstanceID()~=equipTr.gameObject:GetInstanceID() then
     return nil,"equipment panel changed"
   end
-  if requireDragIdle then
+  local dragging=false
+  if requireDragState then
     local drag=pack:_get_drag_panel()
-    if drag==nil or drag:is_dragging()~=false then return nil,"waiting for drag idle" end
+    if drag==nil then return nil,"drag state unavailable" end
+    dragging=drag:is_dragging()
+    if type(dragging)~="boolean" then return nil,"drag state unavailable" end
   end
 
   local data=pack._equip_items
@@ -41,7 +44,7 @@ function M.read(bridge,equipTr,requireDragIdle)
     local id=uid(nativeId)
     if seen[id] then return nil,"duplicate equipment UID" end
     seen[id]=true
-    local row={itemId=id,item=item}
+    local row={itemId=id,item=item,nativeId=nativeId}
     local slot=pack:get_slot_panel_by_index(i)
     if slot~=nil then
       local panel=slot:get_equip_item_panel()
@@ -54,10 +57,11 @@ function M.read(bridge,equipTr,requireDragIdle)
       if row.transform==nil or not row.transform:IsChildOf(equipTr) then
         return nil,"slot moved"
       end
+      row.slot=slot
     end
     rows[i]=row
   end
-  return rows
+  return rows,nil,dragging
 end
 
 function M.report(bridge,equipTr)
@@ -355,7 +359,7 @@ return M
 
 end)()
 local EquipBadgeRuntime=(function()
--- Own the ticker, listeners and overlays. Do not edit any stock slot or label.
+-- Only collapse verified stock slots. Release visibility before a pooled slot is rebound.
 local M={}
 
 local function sameRows(old,rows)
@@ -390,7 +394,7 @@ function M.new(bridge,G,equipTr,viewport,binding,equiv,badges)
   local checking,waiting,disposed=false,false,false
   local catalog,keys,placements=nil,nil,nil
   local eligible,exclusions=0,"none"
-  local lastSlots=nil
+  local hidden,layoutDirty,epoch={},false,0
   local result={status="badge preview: waiting for stable bindings"}
   local rectType=typeof(U.RectTransform)
 
@@ -399,50 +403,181 @@ function M.new(bridge,G,equipTr,viewport,binding,equiv,badges)
     result.status="badge preview: "..reason
   end
 
-  local function locate(tr,vr)
-    if tr==nil or tr.gameObject.activeInHierarchy~=true then return nil end
+  -- Sample all four corners plus the centre, then intersect with the viewport.  A
+  -- slot whose rect is only partly on screen is still visible; testing a single
+  -- corner made a slightly offset row report itself as gone.
+  local function locate(tr,vr,measureHidden)
+    if tr==nil or (not measureHidden and tr.gameObject.activeInHierarchy~=true) then return nil end
     local r=tr.gameObject:GetComponent(rectType)
     if r==nil then return nil end
-    local edge=viewport:InverseTransformPoint(r:TransformPoint(U.Vector3(r.rect.xMax,r.rect.yMin,0)))
-    local x,y=(edge.x-vr.xMin)/vr.width,(edge.y-vr.yMin)/vr.height
-    if x>=0 and x<=1 and y>=0 and y<=1 then return {x=x,y=y} end
-    return nil
+    local rc=r.rect
+    local mx,my=(rc.xMin+rc.xMax)/2,(rc.yMin+rc.yMax)/2
+    local minX,maxX,minY,maxY=math.huge,-math.huge,math.huge,-math.huge
+    local pts={{rc.xMin,rc.yMin},{rc.xMin,rc.yMax},{rc.xMax,rc.yMin},{rc.xMax,rc.yMax},{mx,my}}
+    for k=1,#pts do
+      local p=viewport:InverseTransformPoint(r:TransformPoint(U.Vector3(pts[k][1],pts[k][2],0)))
+      local nx=(p.x-vr.xMin)/vr.width
+      local ny=(p.y-vr.yMin)/vr.height
+      if nx<minX then minX=nx end
+      if nx>maxX then maxX=nx end
+      if ny<minY then minY=ny end
+      if ny>maxY then maxY=ny end
+    end
+    local x0,x1=math.max(minX,0),math.min(maxX,1)
+    local y0,y1=math.max(minY,0),math.min(maxY,1)
+    if x0>x1 or y0>y1 then return nil end
+    return {x=(x0+x1)/2,y=(y0+y1)/2}
   end
 
-  local function ct2Lookup()
-    local ct=equipTr:Find("ScrollView/Viewport/Content")
-    return ct and ct.gameObject or equipTr.gameObject
+  local function content()
+    return equipTr:Find("ScrollView/Viewport/Content")
+  end
+  local function rebuild()
+    if not layoutDirty then return end
+    layoutDirty=false
+    local ct=content()
+    local rect=ct and ct.gameObject:GetComponent(rectType)
+    if rect~=nil then U.UI.LayoutRebuilder.ForceRebuildLayoutImmediate(rect) end
+  end
+  local function slotOf(tr,cid)
+    while tr~=nil do
+      local parent=tr.parent
+      if parent==nil then return nil end
+      if parent.gameObject:GetInstanceID()==cid then return tr end
+      tr=parent
+    end
+  end
+  local function isBound(rec)
+    local panel=rec.slot:get_equip_item_panel()
+    if rec.slot:get_equip_uid()~=rec.uid or panel==nil
+        or not rawequal(panel:get_equip_item(),rec.item) then return false end
+    local tr=panel:get_root_transform()
+    return tr~=nil and tr:IsChildOf(rec.go.transform)
+  end
+  -- The record must outlive the restore attempt.  Dropping it before SetActive
+  -- succeeded left the slot hidden for whatever item was bound next.
+  local function release(id)
+    local rec=hidden[id]
+    if rec==nil then return end
+    if rawget(rec.slot,"setup_view")==rec.wrap then
+      rawset(rec.slot,"setup_view",rec.ownMethod)
+    end
+    -- We only ever hid this object, so its visibility must be restored regardless of
+    -- which item the slot now claims to hold.  Gating on isBound is what leaked the
+    -- hidden state onto the next item after a rebind.
+    if rec.go.activeSelf==false then
+      layoutDirty=true
+      local ok=pcall(function() rec.go:SetActive(true) end)
+      if ok and rec.go.activeSelf==true then
+        hidden[id]=nil
+        return
+      end
+      -- Keep the record so the next tick retries instead of abandoning a hidden object.
+      rec.restoreTries=(rec.restoreTries or 0)+1
+      if rec.restoreTries>120 then hidden[id]=nil end
+      return
+    end
+    hidden[id]=nil
+  end
+  local function discard(reason)
+    epoch=epoch+1
+    catalog,keys=nil,nil
+    pcall(hide,reason)
+    for id in pairs(hidden) do pcall(release,id) end
+  end
+  -- Returns false when this slot cannot be observed.  The caller expands only that
+  -- stack; a slot we cannot watch must never take the whole page down with it.
+  local function conceal(rec)
+    if hidden[rec.id]~=nil or rec.go.activeSelf~=true or not isBound(rec) then return true end
+    local method=rec.slot.setup_view
+    if type(rec.slot)~="table" or type(method)~="function" then return false end
+    rec.ownMethod=rawget(rec.slot,"setup_view")
+    rec.wrap=function(self,...)
+      if self==rec.slot and hidden[rec.id]==rec then
+        -- Bump first: a tick already holding a snapshot must not publish it once
+        -- this slot is committed to a rebind.
+        epoch=epoch+1
+        -- The list callback calls setup_view before replacing UniqueID and item.
+        pcall(release,rec.id)
+        catalog,keys=nil,nil
+        pcall(hide,"slot rebinding")
+      end
+      return method(self,...)
+    end
+    rawset(rec.slot,"setup_view",rec.wrap)
+    hidden[rec.id]=rec
+    layoutDirty=true
+    rec.go:SetActive(false)
+    return true
+  end
+  local function desiredSlots(rows,vr,dragging,ct)
+    local desired,groups,seen={}, {}, {}
+    local cid=ct.gameObject:GetInstanceID()
+    for i,row in ipairs(rows) do
+      local tr=row.transform and slotOf(row.transform,cid)
+      if tr~=nil then
+        local go=tr.gameObject
+        local id=go:GetInstanceID()
+        if seen[id] then return nil end
+        seen[id]=true
+        local old=hidden[id]
+        local ours=old~=nil and rawequal(old.slot,row.slot) and rawequal(old.item,row.item)
+        if go.activeSelf==true or ours then
+          local key=keys[i]
+          local group=groups[key]
+          if group==nil then group={members={}} groups[key]=group end
+          -- Visibility is measured on the slot root, not the icon root: the icon is
+          -- inset inside the cell and reports itself gone while the cell is visible.
+          local rec={id=id,go=go,slot=row.slot,uid=row.nativeId,item=row.item,group=group,
+            inViewport=locate(tr,vr,ours or dragging)~=nil}
+          group.members[#group.members+1]=rec
+          if group.representative==nil and go.activeSelf and rec.inViewport then
+            group.representative=rec
+          end
+        end
+      end
+    end
+    for _,group in pairs(groups) do
+      local first=group.representative
+      -- If the first data row is virtual/offscreen, keep a realized visible slot instead.
+      if first~=nil then
+        local second=nil
+        if dragging then
+          local nextNear,previousNear,passedFirst
+          for _,rec in ipairs(group.members) do
+            if rec==first then
+              passedFirst=true
+            elseif rec.inViewport then
+              second=rec
+              break
+            elseif passedFirst then
+              nextNear=nextNear or rec
+            else
+              previousNear=rec
+            end
+          end
+          second=second or nextNear or previousNear
+        end
+        for _,rec in ipairs(group.members) do
+          if rec~=first and rec~=second then desired[rec.id]=rec end
+        end
+      end
+    end
+    return desired
   end
   local function tick()
     if disposed or waiting then return end
     if not equipTr.gameObject.activeInHierarchy then
-      catalog,keys=nil,nil
-      hide("equipment list hidden")
+      discard("equipment list hidden")
       return
     end
-    local rows,reason=binding.read(bridge,equipTr,true)
-    if rows==nil then
-      -- 拖拽中：每组只展开到 2 个（第一个本来就显示，再放一个出来供拖放），
-      -- 不全展开，避免一次弹出太多格子。
-      if lastSlots~=nil then
-        local any=false
-        for _,rec in ipairs(lastSlots) do
-          local want=(rec.order<=2)
-          if rec.slot.gameObject.activeSelf~=want then
-            rec.slot.gameObject:SetActive(want)
-            any=true
-          end
-        end
-        if any then
-          local cr0=ct2Lookup():GetComponent(rectType)
-          if cr0~=nil then pcall(function() U.UI.LayoutRebuilder.ForceRebuildLayoutImmediate(cr0) end) end
-        end
-      end
-      catalog,keys=nil,nil hide(reason) return
-    end
+    local rows,reason,dragging=binding.read(bridge,equipTr,true)
+    if rows==nil then discard(reason) rebuild() return end
     if not sameRows(catalog,rows) then
-      hide("waiting for stable bindings")
-      catalog,keys=rows,nil
+      discard("waiting for stable bindings")
+      local check=epoch
+      rebuild()
+      if check==epoch then catalog=rows end
       return
     end
     if keys==nil then
@@ -457,54 +592,49 @@ function M.new(bridge,G,equipTr,viewport,binding,equiv,badges)
       eligible=n
       exclusions=#reasons>0 and table.concat(reasons,",") or "none"
     end
-    local vr=viewport.rect
-    if vr.width<=0 or vr.height<=0 then hide("waiting for viewport") return end
+    local vr,ct=viewport.rect,content()
+    if vr.width<=0 or vr.height<=0 or ct==nil then
+      discard("waiting for viewport") rebuild() return
+    end
+    local desired=desiredSlots(rows,vr,dragging,ct)
+    if desired==nil then discard("ambiguous slot mapping") rebuild() return end
+    local check=epoch
+    for id,rec in pairs(hidden) do
+      local nextRec=desired[id]
+      if nextRec==nil or not rawequal(nextRec.slot,rec.slot) or not rawequal(nextRec.item,rec.item)
+          or nextRec.uid~=rec.uid then
+        release(id)
+        if check~=epoch then return end
+      end
+    end
+    local degraded=false
+    for _,rec in pairs(desired) do
+      local g=rec.group
+      if g~=nil and g.degraded then
+        -- This stack is already expanded for this frame.
+      elseif not conceal(rec) then
+        -- Unobservable slot: expand its whole stack and leave the others alone.
+        if g~=nil then
+          g.degraded=true
+          for id,own in pairs(hidden) do
+            if own.group==g then pcall(release,id) end
+          end
+        end
+        degraded=true
+      end
+      if check~=epoch then return end
+    end
+    if degraded then hide("slot not observable") end
+    if dragging then hide("dragging; one extra slot per stack") end
+    if layoutDirty then
+      hide("waiting for layout")
+      rebuild()
+      return
+    end
+    if dragging then return end
     local publish={}
     for i,row in ipairs(rows) do
       publish[i]={itemId=row.itemId,groupKey=keys[i],anchor=locate(row.transform,vr)}
-    end
-    -- 合并：隐藏重复项所在的 Slot（Content 的直接子节点），不是 icon Root
-    local ct2=equipTr:Find("ScrollView/Viewport/Content")
-    local merged=false
-    if ct2~=nil then
-      local cid=ct2.gameObject:GetInstanceID()
-      local function slotOf(tr)
-        local t=tr
-        while t~=nil do
-          local p=t.parent
-          if p==nil then break end
-          if p.gameObject:GetInstanceID()==cid then return t end
-          t=p
-        end
-        return nil
-      end
-      local firstIdx={}
-      local orderIdx={}
-      for mi=1,#rows do
-        local mk=keys[mi]
-        if firstIdx[mk]==nil then firstIdx[mk]=mi end
-        orderIdx[mk]=(orderIdx[mk] or 0)+1
-      end
-      local recs={}
-      for mi=1,#rows do
-        local mt=rows[mi].transform
-        if mt~=nil then
-          local slot=slotOf(mt)
-          if slot~=nil then
-            recs[#recs+1]={slot=slot,order=orderIdx[keys[mi]] or 1}
-            local keep=(firstIdx[keys[mi]]==mi)
-            if slot.gameObject.activeSelf~=keep then
-              slot.gameObject:SetActive(keep)
-              merged=true
-            end
-          end
-        end
-      end
-      lastSlots=recs
-      if merged then
-        local cr=ct2.gameObject:GetComponent(rectType)
-        if cr~=nil then pcall(function() U.UI.LayoutRebuilder.ForceRebuildLayoutImmediate(cr) end) end
-      end
     end
     if samePlacement(placements,publish) then return end
     local token=layer:invalidate()
@@ -519,19 +649,16 @@ function M.new(bridge,G,equipTr,viewport,binding,equiv,badges)
   onStart=function()
     if disposed then return end
     waiting=true
-    catalog,keys=nil,nil
-    pcall(hide,"inventory changing")
+    pcall(discard,"inventory changing")
   end
   onDone=function()
     if disposed then return end
     waiting=false
-    catalog,keys=nil,nil
-    pcall(hide,"waiting for stable bindings")
+    pcall(discard,"waiting for stable bindings")
   end
   function result:invalidate()
     if disposed then return end
-    catalog,keys=nil,nil
-    hide("waiting for stable bindings")
+    discard("waiting for stable bindings")
   end
   function result:dispose()
     if disposed then return end
@@ -540,6 +667,8 @@ function M.new(bridge,G,equipTr,viewport,binding,equiv,badges)
     if subscribedDone then pcall(function() notify.remove_notify_handler(group,done,onDone,owner) end) end
     if scroll~=nil then pcall(function() scroll.onValueChanged:RemoveListener(onScroll) end) end
     if ticker~=nil then pcall(function() ticker:ClearLateTickCallback() end) end
+    pcall(discard,"disposed")
+    pcall(rebuild)
     if layer~=nil then pcall(function() layer:dispose() end) end
     if tickerGo~=nil then pcall(U.Object.Destroy,tickerGo) end
   end
@@ -557,7 +686,7 @@ function M.new(bridge,G,equipTr,viewport,binding,equiv,badges)
       checking=true
       local good=pcall(tick)
       checking=false
-      if not good then catalog,keys=nil,nil pcall(hide,"binding or raw properties unavailable") end
+      if not good then pcall(discard,"binding or raw properties unavailable") pcall(rebuild) end
     end,owner)
     subscribedStart=true
     notify.add_notify_handler(group,start,onStart,owner)
@@ -596,7 +725,7 @@ local state=_G.Q_EQUIP_STATE
 local function disposeBadge()
   if state~=nil and state.badge~=nil then
     local running=state.badge
-    state.badge,state.badgeRevision,state.badgeEquip=nil,nil,nil
+    state.badge,state.badgeRevision,state.badgeEquip,state.badgeViewport=nil,nil,nil,nil
     running:dispose()
   end
 end
@@ -615,28 +744,28 @@ if state==nil or state.panel~=id then
 end
 
 local bpTr=pc.transform:Find("EquipBackpack")
-if bpTr==nil then return "wait bp" end
+if bpTr==nil then disposeBadge() return "wait bp" end
 local eqTr=bpTr:Find("EquipList")
 local consTr=bpTr:Find("ConsumableList")
-if eqTr==nil or consTr==nil then return "wait lists" end
+if eqTr==nil or consTr==nil then disposeBadge() return "wait lists" end
 local bp=bpTr.gameObject
 local equip,consumables=eqTr.gameObject,consTr.gameObject
 local backpackId,equipId,consumablesId=bp:GetInstanceID(),equip:GetInstanceID(),consumables:GetInstanceID()
+local viewport=eqTr:Find("ScrollView/Viewport")
+local viewportId=viewport and viewport.gameObject:GetInstanceID()
+if state.badge~=nil and
+    (state.badgeRevision~=revision or state.badgeEquip~=equipId or state.badgeViewport~=viewportId) then
+  disposeBadge()
+end
 local function status()
-  if state.badge~=nil and
-      (__equipbar_badge_preview==nil or state.badgeRevision~=revision or state.badgeEquip~=equipId) then
-    disposeBadge()
-  end
   if __equipbar_badge_preview~=nil then
-    local viewport=eqTr:Find("ScrollView/Viewport")
     if viewport==nil then disposeBadge() return "badge preview: waiting for viewport" end
-    if state.badge~=nil and state.badgeViewport~=viewport.gameObject:GetInstanceID() then disposeBadge() end
     if state.badge==nil then
       local ok,new,reason=pcall(__equipbar_badge_preview,bridge,G,eqTr,viewport)
       if not ok then return "badge preview: stock UI notifications or ticker unavailable" end
       if new==nil then return reason end
       state.badge,state.badgeRevision,state.badgeEquip=new,revision,equipId
-      state.badgeViewport=viewport.gameObject:GetInstanceID()
+      state.badgeViewport=viewportId
     end
     return state.badge.status
   end
