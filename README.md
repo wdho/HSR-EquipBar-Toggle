@@ -1,6 +1,6 @@
 # HSR EquipBar Toggle
 
-当前版本：**v1.0.2** · [下载](https://github.com/wdho/HSR-EquipBar-Toggle/releases/tag/v1.0.2) · [使用说明](使用说明.md) · [更新记录](CHANGELOG.md)
+当前版本：**v1.0.3** · [下载](https://github.com/wdho/HSR-EquipBar-Toggle/releases/tag/v1.0.3) · [使用说明](使用说明.md) · [更新记录](CHANGELOG.md)
 
 《崩坏：星穹铁道》货币战争（GridFight）备战界面的装备栏收纳按钮。
 
@@ -8,13 +8,20 @@
 
 装备多了会向下延伸挡住晶球等 UI。这个 mod 在右上角加一个小按钮，点一下把整块装备栏收起来，再点一下展开；按钮可拖动，位置自动记住。
 
+v1.0.3 起还支持**同款装备自动合并**：一模一样的装备只占一个格子，右下角角标显示数量。
+
 ## 用法
 
 | 操作 | 行为 |
 |---|---|
-| 单击 | 装备栏整块隐藏 / 恢复显示，箭头同步翻转 `<>` |
-| 按住拖动 | 按钮跟手移动，限制在界面内 |
+| **左键单击** | 装备栏（`EquipList`）隐藏 / 恢复 |
+| **右键单击** | 道具栏（`ConsumableList`）隐藏 / 恢复 |
+| **左键按住拖动** | 按钮跟手移动，限制在界面内 |
 | 松手 | 位置存入 PlayerPrefs，下次进游戏保持 |
+
+按钮上有两条指示条，分别表示装备栏和道具栏当前是否显示。
+
+**装备合并**：同款装备（按原生 `UniqueID` 与 `EquipItemConfig` 属性判等）合并成一个格子，角标显示数量。**开始拖动任意物品时，每组会临时展开到 2 个**，方便你把一件拖到另一件上合成进阶装备，或贴特权卡；松手后自动恢复合并。
 
 按钮默认在右上角。收起是整块显隐，不是把高度压小，格子不会被切到一半。
 
@@ -82,7 +89,13 @@ EquipBarNative.log
 
 `lua_pcall` 是游戏调用 Lua 函数的必经入口，而 Lua state 不是线程安全的，所以脚本必须在这个 hook 里执行，不能从独立线程调用。
 
-折叠只切换 `EquipBackpack` 的 `activeSelf`，不改动布局尺寸和间距。初始化时会把 `Content` 的锚点校正为右上（兼容早期两列布局留下的左侧锚定），之后不再触碰任何布局参数。
+折叠只切换 `EquipList` / `ConsumableList` 的 `activeSelf`，不改动布局尺寸和间距。初始化时会把 `Content` 的锚点校正为右上（兼容早期两列布局留下的左侧锚定），之后不再触碰任何布局参数。
+
+**堆叠识别不依赖图标名**：从 `RPG.Client.GlobalVars.s_UIManager` 取 `GridFightPreparationPage`，读 `_binder.panel_equip_item_pack._equip_items` 的原生数据，逐项校验 `UniqueID` 与槽位绑定，再按 `EquipItemConfig` 的类别、属性列表、Frame、来源类型和售价判等。
+
+**角标是独立图层**：`WDHO_StackBadgeLayer` 挂在 `EquipList/ScrollView/Viewport` 上，用 7 段数码管自绘数字，**完全不修改游戏原生的 `NumText`**。这是为了让对象池复用格子时不会带着外部写入的文字状态，从而彻底避免"数字串到下一件装备"。
+
+**合并时隐藏的是 Slot**（`Content` 的直接子节点），不是 icon 的 `Root`，并调用 `LayoutRebuilder.ForceRebuildLayoutImmediate` 让网格立即收拢，否则会留下空格。
 
 查找节点用 `Transform.Find` 而非 `GameObject.Find`——后者不搜索未激活对象，装备栏一旦隐藏就再也找不到。
 
@@ -92,6 +105,8 @@ EquipBarNative.log
 - `mhypbase` 拦截 `SendInput`，模拟输入驱动不了游戏，按钮必须真人点击
 - `Camera.main` 为 null（Overlay canvas），坐标按 `canvas.scaleFactor` 换算
 - hook 以 `lua_pcall` 导出地址为准，并用 5 字节序言校验；游戏版本更新后需重新确认
+- 特权卡（`Emblem` 类别）不参与合并判等，只按原样显示
+- 拖拽时每组固定展开 2 个，如果某组超过 2 件，第三件起仍在拖拽期间保持隐藏
 
 ## 风险提示
 
