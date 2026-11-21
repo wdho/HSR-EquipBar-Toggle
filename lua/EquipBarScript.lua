@@ -428,6 +428,21 @@ function M.new(bridge,G,equipTr,viewport,binding,equiv,badges)
     if x0>x1 or y0>y1 then return nil end
     return {x=(x0+x1)/2,y=(y0+y1)/2}
   end
+  -- Badge anchor keeps the stock corner semantic: it marks the icon's bottom-right,
+  -- not the centre of the clipped rect.  Conflating the two moved every badge.
+  local function edge(tr,vr)
+    -- The anchor must be observable and inside the viewport: project() rejects
+    -- anything outside [0,1], and rejecting it fails the whole tick, which rolls
+    -- back every fold on screen.  locate() also filters our own hidden slots.
+    if tr==nil or locate(tr,vr)==nil then return nil end
+    local r=tr.gameObject:GetComponent(rectType)
+    if r==nil then return nil end
+    local p=viewport:InverseTransformPoint(r:TransformPoint(U.Vector3(r.rect.xMax,r.rect.yMin,0)))
+    local x,y=(p.x-vr.xMin)/vr.width,(p.y-vr.yMin)/vr.height
+    if x<0 then x=0 elseif x>1 then x=1 end
+    if y<0 then y=0 elseif y>1 then y=1 end
+    return {x=x,y=y}
+  end
 
   local function content()
     return equipTr:Find("ScrollView/Viewport/Content")
@@ -634,7 +649,7 @@ function M.new(bridge,G,equipTr,viewport,binding,equiv,badges)
     if dragging then return end
     local publish={}
     for i,row in ipairs(rows) do
-      publish[i]={itemId=row.itemId,groupKey=keys[i],anchor=locate(row.transform,vr)}
+      publish[i]={itemId=row.itemId,groupKey=keys[i],anchor=edge(row.transform,vr)}
     end
     if samePlacement(placements,publish) then return end
     local token=layer:invalidate()
@@ -642,7 +657,13 @@ function M.new(bridge,G,equipTr,viewport,binding,equiv,badges)
     local ok,count=layer:publish(token,publish)
     if ok then
       placements=publish
-      result.status=("badge preview: backpack=%d badges=%d eligible=%d excluded=%s"):format(#rows,count,eligible,exclusions)
+      local hid,retry=0,0
+      for _,rec in pairs(hidden) do
+        hid=hid+1
+        local tries=rec.restoreTries or 0
+        if tries>retry then retry=tries end
+      end
+      result.status=("badge preview: backpack=%d badges=%d eligible=%d excluded=%s hidden=%d retry=%d"):format(#rows,count,eligible,exclusions,hid,retry)
     end
   end
 

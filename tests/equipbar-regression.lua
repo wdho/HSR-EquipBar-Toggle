@@ -497,3 +497,24 @@ fx:step()
 assert(fx:visible()==3,"unobservable slot expands its group instead of discarding the page")
 fx:assertNativeHidden()
 print("PASS: partial-clip visibility, stale-hide restore and per-group degradation")
+
+-- Field report: dragging one copy of a stacked equipment onto a character made the
+-- items below it disappear.  Dropping leaves FEWER rows and rebinds the pooled slots
+-- in order, so every hide must be undone before the new items are judged.
+fx=fixture()
+assert(tick(30):match("^badge preview:"))
+fx:step()
+assert(fx:visible()==1,"baseline: three equivalents collapse to one")
+
+local m2,m3,m4=fx.pack._equip_items[2],fx.pack._equip_items[3],fx.pack._equip_items[4]
+local s1,s2,s3=fx.slots[1],fx.slots[2],fx.slots[3]
+fx.pack._equip_items={m2,m3,m4}
+s1.bound,s2.bound,s3.bound=m2,m3,m4
+s1:setup_view(m2) s2:setup_view(m3) s3:setup_view(m4)
+fx:step()
+assert(fx:visible()==2,
+  "drop from a stack: one representative for the remaining pair plus the distinct item")
+assert(s3.go.activeSelf,"the equipment below the stack must not disappear")
+assert(s1.go.activeSelf,"the new representative stays visible")
+fx:assertNativeHidden()
+print("PASS: dropping one copy from a stack keeps the rest of the list visible")
