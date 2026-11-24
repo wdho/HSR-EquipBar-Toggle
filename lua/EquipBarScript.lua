@@ -432,12 +432,15 @@ function M.new(bridge,G,equipTr,viewport,binding,equiv,badges,packName)
   local keyCache={}
   local curMapped,curFb=0,0
 local origSize={}
+-- 只恢复我们亲手藏过的格子；游戏自己藏起来的池子空位绝不擅自点亮。
+local ownedHidden={}
 local function softHide(go,on)
   pcall(function()
     local cg=go:GetComponent(typeof(U.CanvasGroup))
     if cg==nil then cg=go:AddComponent(typeof(U.CanvasGroup)) end
     local rt=go:GetComponent(rectType)
     if on then
+      ownedHidden[go]=true
       if rt~=nil and origSize[go]==nil then
         local sd=rt.sizeDelta
         origSize[go]={sd.x,sd.y}
@@ -445,6 +448,7 @@ local function softHide(go,on)
       end
       cg.alpha=0 cg.blocksRaycasts=false cg.interactable=false
     else
+      ownedHidden[go]=nil
       local o=origSize[go]
       if rt~=nil and o~=nil then
         rt.sizeDelta=U.Vector2(o[1],o[2])
@@ -475,6 +479,7 @@ end
     for _,rec in ipairs(lastSlots) do
       if rec.slot~=nil and rec.slot.gameObject~=nil and rec.slot.gameObject.activeSelf~=true then
         rec.slot.gameObject:SetActive(true)
+        softHide(rec.slot.gameObject,false)
         any=true
       end
     end
@@ -782,6 +787,7 @@ end
         end
         curMapped,curFb=mappedCount,fbCount
         local recs,any={},false
+        local present={}
         local reps={}
         for _,mk in ipairs(order) do
           local g=groups[mk]
@@ -792,22 +798,43 @@ end
               if entry.slot.gameObject:GetInstanceID()==prev then keeper=entry.slot found=true break end
             end
           end
-          if not found then keeper=g[1].slot end
+          if not found then
+            keeper=g[1].slot
+            -- 优先落在游戏当前真正显示的格子上，避免为保持一个代表而点亮池子里的空位。
+            for _,entry in ipairs(g) do
+              if entry.slot.gameObject.activeSelf==true then keeper=entry.slot break end
+            end
+          end
           reps[mk]=keeper and keeper.gameObject:GetInstanceID() or nil
           for _,entry in ipairs(g) do
-            recs[#recs+1]={slot=entry.slot}
-            local keep=(entry.slot==keeper)
-            if entry.slot.gameObject.activeSelf~=keep then
-              if keep then
-                entry.slot.gameObject:SetActive(true)
-                softHide(entry.slot.gameObject,false)
-              else
-                softHide(entry.slot.gameObject,true)
-                entry.slot.gameObject:SetActive(false)
-                hiddenSlotOf[mk]=entry.slot
+            local go=entry.slot.gameObject
+            if entry.slot==keeper then
+              if go.activeSelf~=true and ownedHidden[go]==true then
+                go:SetActive(true)
+                softHide(go,false)
+                any=true
               end
-              any=true
+            else
+              local ourHide=ownedHidden[go]==true
+              if go.activeSelf==true then
+                softHide(go,true)
+                go:SetActive(false)
+                ourHide=true
+                any=true
+              end
+              -- 只登记我们亲手藏起来的格子
+              if ourHide then recs[#recs+1]={slot=entry.slot} end
+              if go.activeSelf~=true then present[go]=true end
+              hiddenSlotOf[mk]=entry.slot
             end
+          end
+        end
+        -- 重新分组后（例如换了装备），之前藏、这次不再需要藏的格子必须还原。
+        for go in pairs(ownedHidden) do
+          if present[go]~=true then
+            pcall(function() go:SetActive(true) end)
+            softHide(go,false)
+            any=true
           end
         end
         do

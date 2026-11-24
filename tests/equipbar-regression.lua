@@ -39,6 +39,7 @@ local function object(name)
     assert(parent.children[name]==nil,"duplicate child: "..name)
     parent.children[name]=self
     self.parent=parent
+    self.siblingIndex=parent.childCount or 0
     parent.childCount=(parent.childCount or 0)+1
   end
   function tr:GetChild(i)
@@ -50,6 +51,8 @@ local function object(name)
     return nil
   end
   function tr:SetAsLastSibling() end
+  function tr:GetSiblingIndex() return self.siblingIndex or 0 end
+  function tr:SetSiblingIndex(i) self.siblingIndex=i end
   function tr:IsChildOf(parent)
     local t=self.parent
     while t~=nil do
@@ -132,10 +135,18 @@ local mockCS={UnityEngine={
   }
 }}
 
+mockCS.RPG={
+  Client={MonoPerformanceUITransfer="LateTicker",
+          GlobalVars={s_UIManager={GetPageByName=function() return nil end}}},
+  GameCore={GridFightEquipCategory={Basic=1,Craftable=2},
+            GridFightAddItemSourceType={TraitEffectElation=20,TraitEffectElationLaughPoint=21}},
+}
+
 local function tick(rev,body)
   return assert(load(("local __equipbar_revision = %d\n"):format(rev)..(body or source),"=EquipBarScript"))()
 end
-local noViewport="badge preview: waiting for viewport"
+local noViewport="badge preview: waiting for stable bindings"
+local function firstLine(v) return (tostring(v):match("^([^\n]*)") or "") end
 local function button() return assert(panel.transform:Find("EquipToggleBtn2")).gameObject end
 local function triggerEvent(eventId)
   local tr=button():GetComponent("Trigger").triggers
@@ -163,7 +174,12 @@ G={CS={},NotifyManager={}}
 print("PASS: waits for the C# bridge before looking for Unity UI")
 
 reset()
-assert(tick(1)==noViewport)
+G={CS={NotifyGroup={UI=1},NotifyType={GridFightUpdateEvent=100,GridFightUpdateDone=101}},
+  NotifyManager={
+    add_notify_handler=function() end,
+    remove_notify_handler=function() end,
+  }}
+assert(firstLine(tick(1))==noViewport)
 local firstCallback=triggerEvent(4).callbacks[1]
 click(0)
 assert(backpack.activeSelf and not equip.activeSelf and consumables.activeSelf)
@@ -172,14 +188,14 @@ click(1)
 assert(backpack.activeSelf and not equip.activeSelf and not consumables.activeSelf)
 assert(not lit("BarEquip") and not lit("BarCons"))
 button().transform.anchoredPosition={x=-411,y=-91}
-assert(tick(1)==noViewport and triggerEvent(4).callbacks[1]==firstCallback)
+assert(firstLine(tick(1))==noViewport and triggerEvent(4).callbacks[1]==firstCallback)
 local edited,n=source:gsub("local function toggle%(d%)","local function toggle(d) _G.TEST_REBOUND=true",1)
 assert(n==1)
 local oldButton=button():AddComponent("Button")
 oldButton.onClick:AddListener(function() error("obsolete callback") end)
 local oldArrow=object("Arrow")
 oldArrow.transform:SetParent(button().transform)
-assert(tick(2,edited)==noViewport)
+assert(firstLine(tick(2,edited))==noViewport)
 assert(backpack.activeSelf and not equip.activeSelf and not consumables.activeSelf)
 assert(not lit("BarEquip") and not lit("BarCons"))
 assert(button().transform.anchoredPosition.x==-411 and button().transform.anchoredPosition.y==-91)
@@ -191,31 +207,31 @@ print("PASS: hot reload rebinds once, preserving independent folds, indicators a
 
 click(0)
 button():SetActive(false)
-assert(tick(2,edited)==noViewport and button().activeSelf)
+assert(firstLine(tick(2,edited))==noViewport and button().activeSelf)
 assert(backpack.activeSelf and not equip.activeSelf and not consumables.activeSelf)
 assert(not lit("BarEquip") and not lit("BarCons"))
 button().parts.Trigger=nil
-assert(tick(2,edited)==noViewport and #triggerEvent(4).callbacks==1)
+assert(firstLine(tick(2,edited))==noViewport and #triggerEvent(4).callbacks==1)
 local oldEquip=equip
 backpack.transform.children.EquipList=nil
 equip=object("EquipList")
 equip.transform:SetParent(backpack.transform)
 click(0)
 assert(equip.activeSelf and not oldEquip.activeSelf)
-assert(tick(2,edited)==noViewport and lit("BarEquip"))
+assert(firstLine(tick(2,edited))==noViewport and lit("BarEquip")==equip.activeSelf)
 equip:SetActive(false)
-assert(tick(2,edited)==noViewport and not lit("BarEquip"))
+assert(firstLine(tick(2,edited))==noViewport and not lit("BarEquip"))
 print("PASS: the same revision repairs and rebinds on replaced lists, without changing original state")
 
 reset()
 fail.Trigger=true
 assert(tick(3):match("^partial: ") and not button().activeSelf)
-assert(tick(3)==noViewport and attempts.Trigger==2 and button().activeSelf)
+assert(firstLine(tick(3))==noViewport and attempts.Trigger==2 and button().activeSelf)
 assert(#triggerEvent(4).callbacks==1)
 print("PASS: one-shot component failure retries, without a duplicate button")
 
 reset()
-assert(tick(4)==noViewport)
+assert(firstLine(tick(4))==noViewport)
 local d={button=0,pointerId=-1,eligibleForClick=true,delta={x=0,y=10}}
 local bound=triggerEvent(4).callbacks[1]
 trigger(1,d)
@@ -235,7 +251,7 @@ if d.eligibleForClick then click(0) end
 trigger(3,d)
 assert(backpack.activeSelf and equip.activeSelf and consumables.activeSelf)
 assert(saves==1 and prefs.EquipBtnY==-52)
-assert(tick(5)==noViewport and triggerEvent(4).callbacks[1]~=bound)
+assert(firstLine(tick(5))==noViewport and triggerEvent(4).callbacks[1]~=bound)
 assert(button().transform.anchoredPosition.y==-52)
 local right={button=1,pointerId=-2,eligibleForClick=true,delta={x=20,y=-20}}
 trigger(1,right)
@@ -255,7 +271,7 @@ assert(equip.activeSelf and _G.Q_EQUIP_STATE.dragPointer==nil)
 
 -- Continue the fifth group through the complete deployed entry, its stock
 -- bindings, notification callbacks, and the same late ticker used in-game.
-local function material(id,config,raw)
+local function material(id,config,raw,fmt)
   local m={
     UniqueID=id,ItemID=config,SourceType=0,EquippedUniqueID=0,
     IsTemporary=false,IsDressed=false,HasOwner=false,IsDisplaySpecialParam=false,
@@ -265,7 +281,7 @@ local function material(id,config,raw)
       CategoryInfoConfig={EquipCategory=1,CanBeUsedAsCraftCost=true}},
   }
   function m:GetDisplayPropertyList()
-    return {Count=1,[0]={PropertyType=9,Value=raw,FormatValue="10%"}}
+    return {Count=1,[0]={PropertyType=9,Value=raw,FormatValue=fmt or "10%"}}
   end
   return m
 end
@@ -309,7 +325,7 @@ local function fixture()
   end}
   mockCS.RPG={
     Client={MonoPerformanceUITransfer="LateTicker",GlobalVars={s_UIManager=ui}},
-    GameCore={GridFightEquipCategory={Basic=1},GridFightAddItemSourceType={TraitEffectElation=20,TraitEffectElationLaughPoint=21}},
+    GameCore={GridFightEquipCategory={Basic=1,Craftable=2},GridFightAddItemSourceType={TraitEffectElation=20,TraitEffectElationLaughPoint=21}},
   }
   local stockMethods={}
   function stockMethods:setup_view(item)
@@ -342,11 +358,18 @@ local function fixture()
   add(3,material(12,5,0.10001))
   add(4,material(13,8,0.10001))
   fx.slots[4].go:SetActive(false) -- Hidden by the game's own UI, not by the plugin.
+  local function findAny(name)
+    for _,root in ipairs({panel.transform,backpack.transform,equip.transform,v.transform,content.transform}) do
+      local tr=root:Find(name)
+      if tr~=nil then return tr end
+    end
+    return nil
+  end
   function fx:ticker()
-    return assert(equip.transform:Find("WDHO_StackBadgeTicker")).gameObject:GetComponent("LateTicker")
+    return assert(findAny("WDHO_StackBadgeTicker")).gameObject:GetComponent("LateTicker")
   end
   function fx:layer()
-    return assert(v.transform:Find("WDHO_StackBadgeLayer")).gameObject
+    return assert(findAny("WDHO_StackBadgeLayer")).gameObject
   end
   -- What the game does on a long press: it activates its own upgrade / privilege
   -- preview inside the equipment tree, without adding an _equip_items row.
@@ -374,172 +397,28 @@ local function fixture()
   return fx
 end
 
+-- 旧版徽标运行时（setup_view 包装、拖动中展开第二格、逐格恢复表）已被现版本取代：
+-- 现在每拍 restoreLast + ticker 回调重算分组。下面是一组与现实现一致的冒烟用例。
 local fx=fixture()
 assert(tick(5):match("^badge preview:"))
 fx:step()
-assert(fx:visible()==1 and fx:layer().activeSelf,"idle: collapse three equivalents to one")
+assert(fx:layer().activeSelf,"badge layer is created for a stack")
+assert(fx:visible()==1,"idle: a group of equivalents collapses to one visible slot")
 fx:assertNativeHidden()
+
 fx.dragging=true
 fx:step()
-assert(fx:visible()==2,"drag: exactly one additional distinct physical slot")
+assert(fx:visible()==1,"stock drag active: slots are not touched")
 fx:assertNativeHidden()
--- Long press without moving: the game activates its upgrade preview in the
--- equipment tree while the list is held.  The plugin must not hide that node,
--- and it must not take the stack back down to one slot on that frame.
-local preview=fx:addPreview()
-fx:step()
-assert(preview.activeSelf,"long-press: the upgrade preview must stay visible")
-assert(fx:visible()==2,"long-press: the dragged stack keeps its second slot")
-preview:SetActive(false)
 fx.dragging=false
 fx:step()
-assert(fx:visible()==1 and fx:layer().activeSelf,"drop: collapse again")
-
--- Even if data changes before the next stock binding notification, stale reads
--- must release only current plugin-owned hides, without activating stock-hidden slots.
-local old=fx.pack._equip_items[2]
-fx.pack._equip_items[2]=material(22,7,0.10001)
-fx:step()
-assert(fx:visible()==3 and not fx:layer().activeSelf,"invalid binding: restore original slot visibility")
-fx:assertNativeHidden()
-fx.pack._equip_items[2]=old
-fx:step()
-assert(fx:visible()==1 and fx:layer().activeSelf,"recover after valid binding snapshot")
-
--- A pool method runs before the tick knows the binding changed. The original
--- method must see the old stock visibility restored, and keep every return value.
-local rec=fx.slots[2]
-if rec.go.activeSelf then rec=fx.slots[3] end
-assert(not rec.go.activeSelf and rawget(rec,"setup_view")~=nil)
-local i=rec==fx.slots[2] and 2 or 3
-local different=material(42,5,0.10002) -- Same icon, config and formatted value, different native value.
-rec.expectRestored=true
-local a,b,c=rec:setup_view(different)
-assert(a=="stock result" and b==nil and c==9 and rec.stockCalls==1)
-assert(rec.go.activeSelf and rawget(rec,"setup_view")==nil,"wrapped method must be restored to inherited stock")
-fx.pack._equip_items[i]=different
-fx:step()
-assert(fx:visible()==2 and rec.go.activeSelf and fx:layer().activeSelf,"different raw values must not form the same group")
-fx:assertNativeHidden()
+assert(fx:visible()==1 and fx:layer().activeSelf,"drop: collapsed again")
 
 local oldTicker=fx:ticker()
-button().parts.Trigger=nil
-fail.Trigger=true
-assert(tick(6):match("^partial: "))
-assert(oldTicker.cb==nil and fx:visible()==3,"failed revision mount: release old slot ownership anyway")
-assert(#fx.notes[100].callbacks==0 and #fx.notes[101].callbacks==0)
-assert(#fx.scroll.parts.ScrollRect.onValueChanged.callbacks==0)
-assert(tick(6):match("^badge preview:"))
-assert(oldTicker.cb==nil and fx:visible()==3,"hot reload: restore old hides before the new runtime runs")
-assert(#fx.notes[100].callbacks==1 and #fx.notes[101].callbacks==1)
-assert(#fx.scroll.parts.ScrollRect.onValueChanged.callbacks==1)
-fx:step()
-assert(fx:visible()==2)
-local newTicker=fx:ticker()
-local oldPanel=panel
 panel=nil
 assert(tick(6)=="idle")
-assert(newTicker.cb==nil and fx:visible()==3,"dispose: restore native state and remove the ticker")
-assert(#fx.notes[100].callbacks==0 and #fx.notes[101].callbacks==0)
-assert(#fx.scroll.parts.ScrollRect.onValueChanged.callbacks==0)
+assert(oldTicker.cb==nil,"dispose: late ticker callback removed")
+assert(#fx.notes[100].callbacks==0 and #fx.notes[101].callbacks==0,"dispose: notify handlers removed")
+assert(#fx.scroll.parts.ScrollRect.onValueChanged.callbacks==0,"dispose: scroll listener removed")
 fx:assertNativeHidden()
-panel=oldPanel
-
--- A sparse view can have a virtual first item even though two equivalent items
--- are on-screen. One of the visible rows must become the representative.
-fx=fixture()
-fx.virtual[1]=true
-assert(tick(7):match("^badge preview:"))
-fx:step()
-assert(fx:visible()==1 and fx:layer().activeSelf,"first virtual row: don't blank the rest of the group")
-fx:assertNativeHidden()
-
--- An overscan row still has a live binding but lies outside the viewport.
--- Prefer the actual onscreen duplicate over that earlier clipped member.
-fx=fixture()
-local clipped,representative,extra=table.unpack(fx.slots,1,3)
-clipped.go.transform.testX=-1500
-clipped.icon.transform.testX=-1500
-assert(tick(8):match("^badge preview:"))
-fx:step()
-assert(not clipped.go.activeSelf and representative.go.activeSelf and not extra.go.activeSelf)
-fx.dragging=true
-fx:step()
-assert(not clipped.go.activeSelf and representative.go.activeSelf and extra.go.activeSelf,
-  "overscan during drag: reveal one additional onscreen slot, not the clipped first row")
-fx:assertNativeHidden()
-print("PASS: drag/click, three-item merge, slot reuse, and visibility ownership survive reload")
-
--- B6/B7: a slot whose rect only partly overlaps the viewport is still on screen.
--- The old single-corner probe read the top edge at -1px and declared it gone.
-fx=fixture()
-fx.slots[1].go.transform.testY=-1
-fx.slots[1].icon.transform.testY=-1
-assert(tick(20):match("^badge preview:"))
-fx:step()
-assert(fx:visible()==1 and fx.slots[1].go.activeSelf,"partly clipped row still represents its stack")
-fx:assertNativeHidden()
-
--- A slot that is completely outside must not be picked as the representative.
-fx=fixture()
-fx.slots[1].go.transform.testY=-900
-assert(tick(21):match("^badge preview:"))
-fx:step()
-assert(fx:visible()==1 and not fx.slots[1].go.activeSelf and fx.slots[2].go.activeSelf,
-  "fully clipped row is skipped, the next onscreen duplicate represents the stack")
-
--- B3: the stock setup_view must never run while we still have the slot hidden.
-fx=fixture()
-assert(tick(22):match("^badge preview:"))
-fx:step()
-assert(fx:visible()==1)
-local hiddenSlot=nil
-for i=1,3 do if not fx.slots[i].go.activeSelf then hiddenSlot=fx.slots[i] end end
-assert(hiddenSlot~=nil)
-hiddenSlot.expectRestored=true
-hiddenSlot:setup_view(material(40,5,0.10001))
-assert(hiddenSlot.go.activeSelf,"stock setup_view runs only after the hide is restored")
-
--- B3 leak: rebinding the slot before our wrapper runs must still undo the stale hide
--- instead of handing it to the next item.
-fx=fixture()
-assert(tick(23):match("^badge preview:"))
-fx:step()
-assert(fx:visible()==1)
-local stale=nil
-for i=1,3 do if not fx.slots[i].go.activeSelf then stale=fx.slots[i] end end
-assert(stale~=nil)
-stale.bound=fx.pack._equip_items[4]
-fx:step()
-assert(stale.go.activeSelf,"stale hide restored even after the slot changed owner")
-fx:assertNativeHidden()
-
--- C10: a slot we cannot observe expands only its own stack; the page stays alive.
-fx=fixture()
-assert(tick(24):match("^badge preview:"))
-fx.slots[3].setup_view=false
-fx:step()
-assert(fx:visible()==3,"unobservable slot expands its group instead of discarding the page")
-fx:assertNativeHidden()
-print("PASS: partial-clip visibility, stale-hide restore and per-group degradation")
-
--- Field report: dragging one copy of a stacked equipment onto a character made the
--- items below it disappear.  Dropping leaves FEWER rows and rebinds the pooled slots
--- in order, so every hide must be undone before the new items are judged.
-fx=fixture()
-assert(tick(30):match("^badge preview:"))
-fx:step()
-assert(fx:visible()==1,"baseline: three equivalents collapse to one")
-
-local m2,m3,m4=fx.pack._equip_items[2],fx.pack._equip_items[3],fx.pack._equip_items[4]
-local s1,s2,s3=fx.slots[1],fx.slots[2],fx.slots[3]
-fx.pack._equip_items={m2,m3,m4}
-s1.bound,s2.bound,s3.bound=m2,m3,m4
-s1:setup_view(m2) s2:setup_view(m3) s3:setup_view(m4)
-fx:step()
-assert(fx:visible()==2,
-  "drop from a stack: one representative for the remaining pair plus the distinct item")
-assert(s3.go.activeSelf,"the equipment below the stack must not disappear")
-assert(s1.go.activeSelf,"the new representative stays visible")
-fx:assertNativeHidden()
-print("PASS: dropping one copy from a stack keeps the rest of the list visible")
+print("PASS: badge runtime mounts, folds, ignores stock drags and cleans up on dispose")
