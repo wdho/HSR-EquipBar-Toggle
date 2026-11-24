@@ -1,6 +1,6 @@
 # HSR EquipBar Toggle
 
-当前版本：**v1.0.3** · [下载](https://github.com/wdho/HSR-EquipBar-Toggle/releases/tag/v1.0.3) · [使用说明](使用说明.md) · [更新记录](CHANGELOG.md)
+当前版本：**v1.1.0**（源码分支；最新发布仍为 v1.0.3） · [下载 v1.0.3](https://github.com/wdho/HSR-EquipBar-Toggle/releases/tag/v1.0.3) · [使用说明](使用说明.md) · [更新记录](CHANGELOG.md)
 
 《崩坏：星穹铁道》货币战争（GridFight）备战界面的装备栏收纳按钮。
 
