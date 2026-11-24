@@ -1,3 +1,27 @@
+local __pr=(function()
+  local S=_G.Q_EQUIP_PROBE
+  if type(S)~="table" or type(S.buf)~="table" or type(S.last)~="table" then
+    S={buf={},n=0,last={}}
+    _G.Q_EQUIP_PROBE=S
+  end
+  return S
+end)()
+local function zprobe(s)
+  if __pr.n>=100000 then return end
+  __pr.n=__pr.n+1
+  if #__pr.buf<48 then __pr.buf[#__pr.buf+1]=tostring(s) end
+end
+local function zprobeOnce(tag,val)
+  if __pr.last[tag]==val then return false end
+  __pr.last[tag]=val
+  return true
+end
+local function zprobeDrain()
+  if #__pr.buf==0 then return "" end
+  local s=table.concat(__pr.buf," ;; ")
+  __pr.buf={}
+  return s
+end
 local EquipBinding=(function()
 -- Read the current backpack model and verify the visible slot's native binding.
 local M={}
@@ -10,58 +34,76 @@ local function uid(value)
   error("unsupported equipment UID")
 end
 
-function M.read(bridge,equipTr,requireDragState)
+function M.read(bridge,equipTr,requireDragIdle,packName)
   local client=bridge.RPG.Client
   local page=client.GlobalVars.s_UIManager:GetPageByName("GridFightPreparationPage")
   local pageData=page and page.LuaTable
   if pageData==nil then return nil,"waiting for preparation page" end
   local binder=pageData._binder
-  local pack=binder and binder.panel_equip_item_pack
+  local name=packName or "panel_equip_item_pack"
+  local pack=binder and binder[name]
   if pack==nil then return nil,"waiting for equipment panel" end
-  local root=pack:get_root_transform()
-  if root==nil or root.gameObject:GetInstanceID()~=equipTr.gameObject:GetInstanceID() then
+  local okRoot,root=pcall(function() return pack:get_root_transform() end)
+  if not okRoot or root==nil or root.gameObject:GetInstanceID()~=equipTr.gameObject:GetInstanceID() then
     return nil,"equipment panel changed"
   end
-  local dragging=false
-  if requireDragState then
-    local drag=pack:_get_drag_panel()
-    if drag==nil then return nil,"drag state unavailable" end
-    dragging=drag:is_dragging()
-    if type(dragging)~="boolean" then return nil,"drag state unavailable" end
+  if requireDragIdle then
+    local okDrag=pcall(function()
+      local drag=pack:_get_drag_panel()
+      if drag==nil or drag:is_dragging()~=false then error("busy") end
+    end)
+    if not okDrag then return nil,"waiting for drag idle" end
   end
-
-  local data=pack._equip_items
+  local data=pack._equip_items or pack._items
   if type(data)~="table" then return nil,"waiting for equipment data" end
   local rows,seen={},{}
   local n=#data
   for i in pairs(data) do
-    if type(i)~="number" or i%1~=0 or i<1 or i>n then return nil,"invalid equipment list" end
+    if type(i)~="number" or i%1~=0 or i<1 or i>n then return nil,"invalid list" end
   end
+  local hasSlotFn=pcall(function() return pack.get_slot_panel_by_index end) and pack.get_slot_panel_by_index~=nil
+  local content=nil
+  if not hasSlotFn then content=equipTr:Find("ScrollView/Viewport/Content") end
   for i=1,n do
     local item=data[i]
-    if item==nil then return nil,"invalid equipment list" end
+    if item==nil then return nil,"invalid list" end
     local nativeId=item.UniqueID
     local id=uid(nativeId)
-    if seen[id] then return nil,"duplicate equipment UID" end
+    if seen[id] then return nil,"duplicate uid" end
     seen[id]=true
-    local row={itemId=id,item=item,nativeId=nativeId}
-    local slot=pack:get_slot_panel_by_index(i)
-    if slot~=nil then
-      local panel=slot:get_equip_item_panel()
-      local bound=panel and panel:get_equip_item()
-      if bound==nil or slot:get_equip_uid()~=nativeId
-          or bound.UniqueID~=nativeId or not rawequal(bound,item) then
-        return nil,"slot rebinding"
+    local row={itemId=id,item=item}
+    if hasSlotFn then
+      local okSlot,slot=pcall(function() return pack:get_slot_panel_by_index(i) end)
+      if okSlot and slot~=nil then
+        local okBind,good=pcall(function()
+          local panel=slot:get_equip_item_panel()
+          local bound=panel and panel:get_equip_item()
+          if bound==nil or slot:get_equip_uid()~=nativeId
+              or bound.UniqueID~=nativeId or not rawequal(bound,item) then return false end
+          local tr=panel:get_root_transform()
+          if tr==nil or not tr:IsChildOf(equipTr) then return false end
+          row.transform=tr
+          return true
+        end)
+        if not okBind or not good then rows.unstable=true end
       end
-      row.transform=panel:get_root_transform()
-      if row.transform==nil or not row.transform:IsChildOf(equipTr) then
-        return nil,"slot moved"
-      end
-      row.slot=slot
+    elseif content~=nil then
+      local okChild,childTr=pcall(function() return content:GetChild(i-1) end)
+      if okChild and childTr~=nil then row.transform=childTr end
     end
     rows[i]=row
   end
-  return rows,nil,dragging
+  return rows
+end
+
+function M.pack(bridge,packName)
+  local client=bridge.RPG.Client
+  local page=client.GlobalVars.s_UIManager:GetPageByName("GridFightPreparationPage")
+  local pageData=page and page.LuaTable
+  if pageData==nil then return nil end
+  local binder=pageData._binder
+  local name=packName or "panel_equip_item_pack"
+  return binder and binder[name] or nil
 end
 
 function M.report(bridge,equipTr)
@@ -109,51 +151,25 @@ end
 local function read(game,item)
   local cfg=item.EquipItemConfig
   local category=cfg.CategoryInfoConfig
-  local material=game.GridFightEquipCategory.Basic
-  if material==nil or category.EquipCategory~=material
-      or category.CanBeUsedAsCraftCost~=true then return nil,"not-basic" end
+  local categories=game.GridFightEquipCategory
+  local basic,craftable=categories.Basic,categories.Craftable
+  if basic==nil or craftable==nil then return nil,"not-basic" end
+  local equipCategory=category.EquipCategory
+  -- Basic/Craftable: 简易/进阶装备。
+  -- Emblem(星辉) / Crown(特权) / Radiant(光耀)：用户要求「同样的也叠起来」，
+  -- 这些类别同样按 ItemID 归组；GoldTrash(废料) 等仍排除。
+  -- EquipCategory 是枚举值（比较用 tostring 才能同时兼容数字和 xLua 枚举）。
+  local allowed={}
+  for _,name in ipairs({"Basic","Craftable","Emblem","Crown","TraitSpecial","Artifacts","Radiant","Support","Other","FateEquip","Intrinsic","SpotLightEquip","Material","Trash","GoldTrash"}) do
+    local v=categories[name]
+    if v~=nil then allowed[tostring(v)]=true end
+  end
+  if not allowed[tostring(equipCategory)] then return nil,"not-basic" end
   local id=item.ItemID
   if not integer(id) or id<=0 or id~=cfg.ItemConfig.ItemID then return nil,"config" end
-  local source=item.SourceType
-  local elation=game.GridFightAddItemSourceType
-  if not atom(source) or elation.TraitEffectElation==nil or elation.TraitEffectElationLaughPoint==nil then
-    return nil,"source"
-  end
-  if source==elation.TraitEffectElation or source==elation.TraitEffectElationLaughPoint
-      or item.IsTemporary~=false or item.IsDisplaySpecialParam~=false
-      or item.IsDressed~=false or item.HasOwner~=false or item.EquippedUniqueID~=0 then
-    return nil,"variant"
-  end
-  local extra=item.ExtraDescList
-  if (extra~=nil and extra.Count~=0) or (cfg.ElationDesc~=nil and cfg.ElationDesc~="") then
-    return nil,"extra-effect"
-  end
-  local frame=item.FrameInfo
-  if frame==nil or frame.HasTraitFrame~=false or not atom(frame.Rank) then return nil,"frame" end
-  local sell,price=item.CanSell,item.SellPrice
-  if type(sell)~="boolean" or not integer(price) then return nil,"sale" end
-
-  local listOk,properties=pcall(function() return item:GetDisplayPropertyList() end)
-  if not listOk or properties==nil or not integer(properties.Count) or properties.Count<=0 then return nil,"properties" end
-  local raw={}
-  for i=0,properties.Count-1 do
-    local prop=properties[i]
-    if prop==nil then return nil,"property-type" end
-    local fieldOk,kind,value=pcall(function() return prop.PropertyType,prop.Value end)
-    if not fieldOk or not atom(kind) then return nil,"property-type" end
-    if type(value)=="userdata" then
-      -- Native Lua compares this FixPoint value with FixPoint.Zero using '<'.
-      -- If the adapter does not expose that comparison, fail closed.
-      local zero=game.FixPoint.Zero
-      if type(zero)~="userdata" or getmetatable(value)~=getmetatable(zero) then return nil,"property-value" end
-      local lt,gt=value<zero,zero<value
-      if lt and gt then return nil,"property-value" end
-    elseif not finite(value) then
-      return nil,"property-value"
-    end
-    raw[#raw+1]={kind,value}
-  end
-  return {id=id,source=source,rank=frame.Rank,sell=sell,price=price,raw=raw}
+  -- 只保留「类别白名单 + ItemID 合法」：来源/临时/已穿戴/额外词条/框/售格
+  -- 都是实例状态或显示差异，和「是不是同一种装备」无关，会把大量装备挡在折叠之外。
+  return {id=id,raw={},category=equipCategory}
 end
 
 local function equal(a,b)
@@ -168,7 +184,7 @@ local function equal(a,b)
 end
 
 function M.classify(bridge,rows)
-  local result,byConfig,excluded={},{},{}
+  local result,byName,excluded={},{},{}
   local game=bridge.RPG.GameCore
   local classes=0
   for i,row in ipairs(rows) do
@@ -179,17 +195,31 @@ function M.classify(bridge,rows)
       -- A distinct non-shared key makes an unknown row ineligible for any badge.
       result[i]="excluded:"..row.itemId
     else
-      local peers=byConfig[profile.id]
-      if peers==nil then peers={} byConfig[profile.id]=peers end
-      local key
-      for _,peer in ipairs(peers) do
-        local compared,match=pcall(equal,profile,peer.profile)
-        if compared and match then key=peer.key break end
+      -- 分组按「物品名」优先：蓝钻/红钻/财富宝钻这类每件 ItemID 不同但名字相同，
+      -- 只按 ItemID 分组永远叠不起来；名字取不到时退回 ItemID。
+      -- 崩铁每件装备属性固定，同名即同物；但特权/普通/羁绊三类必须各自独立，
+      -- 所以分组键 = 类别编号 + 物品名（名字取不到时退回 ItemID）。
+      local cid=profile.category
+      local okName,nm=pcall(function()
+        local rowCfg=row.item.EquipItemConfig
+        local ic=rowCfg and rowCfg.ItemConfig
+        if ic==nil then return nil end
+        return bridge.RPG.Client.TextmapStatic.GetText(ic.ItemName)
+      end)
+      if not okName or type(nm)~="string" or nm=="" then nm=nil end
+      -- 羁绊装备（阿哈/星核猎手等角色的专属装备）与普通装备同名同 ItemID，
+      -- 唯一区别是来源 SourceType（游戏里图标右下角有面具笑脸、可出售）。
+      -- 不同羁绊来源必须各自成组，所以键里带完整的 SourceType 文本。
+      local trait="0"
+      local okSrc,srcv=pcall(function() return tostring(row.item.SourceType) end)
+      if okSrc and type(srcv)=="string" and srcv:sub(1,11)=="TraitEffect" then
+        trait=srcv
       end
-      if key==nil then
-        classes=classes+1
-        key="material:"..classes
-        peers[#peers+1]={profile=profile,key=key}
+      local key
+      if nm~=nil then
+        key="c"..tostring(cid).."|t:"..trait.."|n:"..nm
+      else
+        key="c"..tostring(cid).."|t:"..trait.."|item:"..tostring(profile.id)
       end
       result[i]=key
     end
@@ -359,7 +389,7 @@ return M
 
 end)()
 local EquipBadgeRuntime=(function()
--- Only collapse verified stock slots. Release visibility before a pooled slot is rebound.
+-- Own the ticker, listeners and overlays. Do not edit any stock slot or label.
 local M={}
 
 local function sameRows(old,rows)
@@ -382,7 +412,7 @@ local function samePlacement(old,rows)
   return true
 end
 
-function M.new(bridge,G,equipTr,viewport,binding,equiv,badges)
+function M.new(bridge,G,equipTr,viewport,binding,equiv,badges,packName)
   local U=bridge.UnityEngine
   local notify=G.NotifyManager
   local group=G.CS.NotifyGroup.UI
@@ -394,210 +424,148 @@ function M.new(bridge,G,equipTr,viewport,binding,equiv,badges)
   local checking,waiting,disposed=false,false,false
   local catalog,keys,placements=nil,nil,nil
   local eligible,exclusions=0,"none"
-  local hidden,layoutDirty,epoch={},false,0
+    local restoreDone=false
+  local lastSlots=nil
+  -- 每组「当前可见的那一格」的实例 ID：组内数量变化时优先保持同一格可见，
+  -- 否则代表格会跳走，看起来就像展开后位置不对。
+  local repByKey={}
+  local keyCache={}
+  local curMapped,curFb=0,0
+local origSize={}
+local function softHide(go,on)
+  pcall(function()
+    local cg=go:GetComponent(typeof(U.CanvasGroup))
+    if cg==nil then cg=go:AddComponent(typeof(U.CanvasGroup)) end
+    local rt=go:GetComponent(rectType)
+    if on then
+      if rt~=nil and origSize[go]==nil then
+        local sd=rt.sizeDelta
+        origSize[go]={sd.x,sd.y}
+        rt.sizeDelta=U.Vector2(0,0)
+      end
+      cg.alpha=0 cg.blocksRaycasts=false cg.interactable=false
+    else
+      local o=origSize[go]
+      if rt~=nil and o~=nil then
+        rt.sizeDelta=U.Vector2(o[1],o[2])
+        origSize[go]=nil
+      end
+      cg.alpha=1 cg.blocksRaycasts=true cg.interactable=true
+    end
+  end)
+end
   local result={status="badge preview: waiting for stable bindings"}
   local rectType=typeof(U.RectTransform)
+  local dragGrace=0
+  local stLast=0
+  local holdTicks=0
+  local hoverKey=nil
+  local dragRevealKey=nil
+  -- 每组「我们亲手隐藏的那一格」。拖动分副本时优先用它：这格一定同组同一件，
+  -- 不会像游戏复用池里的空格子那样还留着上一件装备的画（红钻位置冒出蓝钻）。
+  local hiddenSlotOf={}
+  local function mouseHeld()
+    local ok,held=pcall(function() return U.Input.GetMouseButton(0) end)
+    return ok and held==true
+  end
+  -- 只恢复「我们自己关掉过」的格子，绝不碰游戏自己的空位/池子。
+  local function restoreLast()
+    if lastSlots==nil then return end
+    local any=false
+    for _,rec in ipairs(lastSlots) do
+      if rec.slot~=nil and rec.slot.gameObject~=nil and rec.slot.gameObject.activeSelf~=true then
+        rec.slot.gameObject:SetActive(true)
+        any=true
+      end
+    end
+    lastSlots=nil
+    if any then
+      local ct=equipTr:Find("ScrollView/Viewport/Content")
+      if ct~=nil then
+        local cr=ct.gameObject:GetComponent(rectType)
+        if cr~=nil then pcall(function() U.UI.LayoutRebuilder.ForceRebuildLayoutImmediate(cr) end) end
+      end
+    end
+  end
 
   local function hide(reason)
     if placements~=nil then placements=nil layer:invalidate() end
     result.status="badge preview: "..reason
   end
 
-  -- Sample all four corners plus the centre, then intersect with the viewport.  A
-  -- slot whose rect is only partly on screen is still visible; testing a single
-  -- corner made a slightly offset row report itself as gone.
-  local function locate(tr,vr,measureHidden)
-    if tr==nil or (not measureHidden and tr.gameObject.activeInHierarchy~=true) then return nil end
+  local function locate(tr,vr)
+    if tr==nil or tr.gameObject.activeInHierarchy~=true then return nil end
     local r=tr.gameObject:GetComponent(rectType)
     if r==nil then return nil end
-    local rc=r.rect
-    local mx,my=(rc.xMin+rc.xMax)/2,(rc.yMin+rc.yMax)/2
-    local minX,maxX,minY,maxY=math.huge,-math.huge,math.huge,-math.huge
-    local pts={{rc.xMin,rc.yMin},{rc.xMin,rc.yMax},{rc.xMax,rc.yMin},{rc.xMax,rc.yMax},{mx,my}}
-    for k=1,#pts do
-      local p=viewport:InverseTransformPoint(r:TransformPoint(U.Vector3(pts[k][1],pts[k][2],0)))
-      local nx=(p.x-vr.xMin)/vr.width
-      local ny=(p.y-vr.yMin)/vr.height
-      if nx<minX then minX=nx end
-      if nx>maxX then maxX=nx end
-      if ny<minY then minY=ny end
-      if ny>maxY then maxY=ny end
-    end
-    local x0,x1=math.max(minX,0),math.min(maxX,1)
-    local y0,y1=math.max(minY,0),math.min(maxY,1)
-    if x0>x1 or y0>y1 then return nil end
-    return {x=(x0+x1)/2,y=(y0+y1)/2}
-  end
-  -- Badge anchor keeps the stock corner semantic: it marks the icon's bottom-right,
-  -- not the centre of the clipped rect.  Conflating the two moved every badge.
-  local function edge(tr,vr)
-    -- The anchor must be observable and inside the viewport: project() rejects
-    -- anything outside [0,1], and rejecting it fails the whole tick, which rolls
-    -- back every fold on screen.  locate() also filters our own hidden slots.
-    if tr==nil or locate(tr,vr)==nil then return nil end
-    local r=tr.gameObject:GetComponent(rectType)
-    if r==nil then return nil end
-    local p=viewport:InverseTransformPoint(r:TransformPoint(U.Vector3(r.rect.xMax,r.rect.yMin,0)))
-    local x,y=(p.x-vr.xMin)/vr.width,(p.y-vr.yMin)/vr.height
-    if x<0 then x=0 elseif x>1 then x=1 end
-    if y<0 then y=0 elseif y>1 then y=1 end
-    return {x=x,y=y}
+    local edge=viewport:InverseTransformPoint(r:TransformPoint(U.Vector3(r.rect.xMax,r.rect.yMin,0)))
+    local x,y=(edge.x-vr.xMin)/vr.width,(edge.y-vr.yMin)/vr.height
+    if x>=0 and x<=1 and y>=0 and y<=1 then return {x=x,y=y} end
+    return nil
   end
 
-  local function content()
-    return equipTr:Find("ScrollView/Viewport/Content")
+  local function ct2Lookup()
+    local ct=equipTr:Find("ScrollView/Viewport/Content")
+    return ct and ct.gameObject or equipTr.gameObject
   end
-  local function rebuild()
-    if not layoutDirty then return end
-    layoutDirty=false
-    local ct=content()
-    local rect=ct and ct.gameObject:GetComponent(rectType)
-    if rect~=nil then U.UI.LayoutRebuilder.ForceRebuildLayoutImmediate(rect) end
-  end
-  local function slotOf(tr,cid)
-    while tr~=nil do
-      local parent=tr.parent
-      if parent==nil then return nil end
-      if parent.gameObject:GetInstanceID()==cid then return tr end
-      tr=parent
+  local suppressed=false
+  function result:suppress(v)
+    suppressed=v==true
+    if suppressed and placements~=nil then
+      placements=nil
+      pcall(function() layer:invalidate() end)
     end
-  end
-  local function isBound(rec)
-    local panel=rec.slot:get_equip_item_panel()
-    if rec.slot:get_equip_uid()~=rec.uid or panel==nil
-        or not rawequal(panel:get_equip_item(),rec.item) then return false end
-    local tr=panel:get_root_transform()
-    return tr~=nil and tr:IsChildOf(rec.go.transform)
-  end
-  -- The record must outlive the restore attempt.  Dropping it before SetActive
-  -- succeeded left the slot hidden for whatever item was bound next.
-  local function release(id)
-    local rec=hidden[id]
-    if rec==nil then return end
-    if rawget(rec.slot,"setup_view")==rec.wrap then
-      rawset(rec.slot,"setup_view",rec.ownMethod)
-    end
-    -- We only ever hid this object, so its visibility must be restored regardless of
-    -- which item the slot now claims to hold.  Gating on isBound is what leaked the
-    -- hidden state onto the next item after a rebind.
-    if rec.go.activeSelf==false then
-      layoutDirty=true
-      local ok=pcall(function() rec.go:SetActive(true) end)
-      if ok and rec.go.activeSelf==true then
-        hidden[id]=nil
-        return
-      end
-      -- Keep the record so the next tick retries instead of abandoning a hidden object.
-      rec.restoreTries=(rec.restoreTries or 0)+1
-      if rec.restoreTries>120 then hidden[id]=nil end
-      return
-    end
-    hidden[id]=nil
-  end
-  local function discard(reason)
-    epoch=epoch+1
-    catalog,keys=nil,nil
-    pcall(hide,reason)
-    for id in pairs(hidden) do pcall(release,id) end
-  end
-  -- Returns false when this slot cannot be observed.  The caller expands only that
-  -- stack; a slot we cannot watch must never take the whole page down with it.
-  local function conceal(rec)
-    if hidden[rec.id]~=nil or rec.go.activeSelf~=true or not isBound(rec) then return true end
-    local method=rec.slot.setup_view
-    if type(rec.slot)~="table" or type(method)~="function" then return false end
-    rec.ownMethod=rawget(rec.slot,"setup_view")
-    rec.wrap=function(self,...)
-      if self==rec.slot and hidden[rec.id]==rec then
-        -- Bump first: a tick already holding a snapshot must not publish it once
-        -- this slot is committed to a rebind.
-        epoch=epoch+1
-        -- The list callback calls setup_view before replacing UniqueID and item.
-        pcall(release,rec.id)
-        catalog,keys=nil,nil
-        pcall(hide,"slot rebinding")
-      end
-      return method(self,...)
-    end
-    rawset(rec.slot,"setup_view",rec.wrap)
-    hidden[rec.id]=rec
-    layoutDirty=true
-    rec.go:SetActive(false)
-    return true
-  end
-  local function desiredSlots(rows,vr,dragging,ct)
-    local desired,groups,seen={}, {}, {}
-    local cid=ct.gameObject:GetInstanceID()
-    for i,row in ipairs(rows) do
-      local tr=row.transform and slotOf(row.transform,cid)
-      if tr~=nil then
-        local go=tr.gameObject
-        local id=go:GetInstanceID()
-        if seen[id] then return nil end
-        seen[id]=true
-        local old=hidden[id]
-        local ours=old~=nil and rawequal(old.slot,row.slot) and rawequal(old.item,row.item)
-        if go.activeSelf==true or ours then
-          local key=keys[i]
-          local group=groups[key]
-          if group==nil then group={members={}} groups[key]=group end
-          -- Visibility is measured on the slot root, not the icon root: the icon is
-          -- inset inside the cell and reports itself gone while the cell is visible.
-          local rec={id=id,go=go,slot=row.slot,uid=row.nativeId,item=row.item,group=group,
-            inViewport=locate(tr,vr,ours or dragging)~=nil}
-          group.members[#group.members+1]=rec
-          if group.representative==nil and go.activeSelf and rec.inViewport then
-            group.representative=rec
-          end
-        end
-      end
-    end
-    for _,group in pairs(groups) do
-      local first=group.representative
-      -- If the first data row is virtual/offscreen, keep a realized visible slot instead.
-      if first~=nil then
-        local second=nil
-        if dragging then
-          local nextNear,previousNear,passedFirst
-          for _,rec in ipairs(group.members) do
-            if rec==first then
-              passedFirst=true
-            elseif rec.inViewport then
-              second=rec
-              break
-            elseif passedFirst then
-              nextNear=nextNear or rec
-            else
-              previousNear=rec
-            end
-          end
-          second=second or nextNear or previousNear
-        end
-        for _,rec in ipairs(group.members) do
-          if rec~=first and rec~=second then desired[rec.id]=rec end
-        end
-      end
-    end
-    return desired
   end
   local function tick()
-    if disposed or waiting then return end
-    if not equipTr.gameObject.activeInHierarchy then
-      discard("equipment list hidden")
+    if disposed then return end
+    do
+      local ST=_G.Q_EQUIP_STATE
+      if ST~=nil and type(ST.onFrame)=="function" then pcall(ST.onFrame) end
+    end
+    if _G.Q_EQUIP_STATE~=nil and _G.Q_EQUIP_STATE.vanilla==true then
+      pcall(restoreLast)
+      if placements~=nil then placements=nil pcall(function() layer:invalidate() end) end
+      result.status="badge preview: vanilla mode (stacking off)"
       return
     end
-    local rows,reason,dragging=binding.read(bridge,equipTr,true)
-    if rows==nil then discard(reason) rebuild() return end
+    if suppressed then
+      if placements~=nil then placements=nil pcall(function() layer:invalidate() end) end
+      result.status="badge preview: bar hidden by user"
+      return
+    end
+    if not equipTr.gameObject.activeInHierarchy then
+      catalog,keys=nil,nil
+      hide("equipment list hidden")
+      return
+    end
+    local rows,reason=binding.read(bridge,equipTr,packName==nil,packName)
+    if rows==nil then
+      dragGrace=0
+      catalog,keys=nil,nil hide(reason) return
+    end
+    if keys==nil then
+      -- 面板重建后旧的两拍稳定判定会让整排装备先展开一两秒。
+      -- 用 itemId→分组 缓存，只要能全部命中就直接隐藏，不等稳定。
+      local cached,okAll={},true
+      for ci=1,#rows do
+        local ck=keyCache[rows[ci].itemId]
+        if ck==nil then okAll=false break end
+        cached[ci]=ck
+      end
+      if okAll and #cached==#rows then
+        catalog,keys=rows,cached
+      end
+    end
     if not sameRows(catalog,rows) then
-      discard("waiting for stable bindings")
-      local check=epoch
-      rebuild()
-      if check==epoch then catalog=rows end
+      hide("waiting for stable bindings")
+      catalog,keys=rows,nil
       return
     end
     if keys==nil then
       local excluded
       keys,excluded=equiv.classify(bridge,rows)
+      for ci=1,#rows do
+        if keys[ci]~=nil then keyCache[rows[ci].itemId]=keys[ci] end
+      end
       local reasons,n={},#rows
       for name,count in pairs(excluded) do
         reasons[#reasons+1]=name..":"..count
@@ -605,91 +573,392 @@ function M.new(bridge,G,equipTr,viewport,binding,equiv,badges)
       end
       table.sort(reasons)
       eligible=n
-      exclusions=#reasons>0 and table.concat(reasons,",") or "none"
-    end
-    local vr,ct=viewport.rect,content()
-    if vr.width<=0 or vr.height<=0 or ct==nil then
-      discard("waiting for viewport") rebuild() return
-    end
-    local desired=desiredSlots(rows,vr,dragging,ct)
-    if desired==nil then discard("ambiguous slot mapping") rebuild() return end
-    local check=epoch
-    for id,rec in pairs(hidden) do
-      local nextRec=desired[id]
-      if nextRec==nil or not rawequal(nextRec.slot,rec.slot) or not rawequal(nextRec.item,rec.item)
-          or nextRec.uid~=rec.uid then
-        release(id)
-        if check~=epoch then return end
+      exclusions=#reasons>0 and table.concat(reasons,",") or "none"    end
+    -- 折叠：鼠标按住、或拖动刚结束的几帧内一律不隐藏；开始拖动立刻全恢复。
+    dragGrace=dragGrace+1
+    local heldNow=mouseHeld()
+    if heldNow then holdTicks=holdTicks+1 else holdTicks=0 end
+    -- Input.GetMouseButton 在 IL2CPP 下有时会一直返回 true（点了之后不再复位），
+    -- 那样整段隐藏逻辑会被永久跳过，表现就是「一操作就全展开」。
+    -- 连续按住超过约 2 秒就当作失灵，照常隐藏。
+    local heldStuck=heldNow and holdTicks>40
+    if (heldNow and not heldStuck) or dragGrace<2 then
+      -- 拖动中/刚落手：完全不碰格子，既不隐藏也不展开。
+      -- 例外：简易装备要和同款合成，拖动时给每个简易组额外放出一个副本。
+      if heldNow and not heldStuck and keys~=nil then
+        pcall(function()
+          local ctd=equipTr:Find("ScrollView/Viewport/Content")
+          if ctd==nil then return end
+          local cidd=ctd.gameObject:GetInstanceID()
+          local function slotOf(tr)
+            local t=tr
+            while t~=nil do
+              local pp=t.parent
+              if pp==nil then break end
+              if pp.gameObject:GetInstanceID()==cidd then return t end
+              t=pp
+            end
+            return nil
+          end
+          local mk,how=hoverKey,"hover"
+          if type(mk)~="string" or mk:sub(1,9)=="excluded" then mk,how=nil,"none" end
+          -- 需要"拖动时分出一个"来合成的只有两类：
+          --   简易装备 Basic（含阿哈/星核猎手那类羁绊简易）
+          --   钻石类 Material（蓝钻/红钻，用于合成流派星徽）
+          -- 星辉/特权/进阶/财富宝钻都不能自合成，不放副本。
+          local wantReveal=false
+          if mk~=nil then
+            if mk:sub(1,6)=="cBasic" then
+              wantReveal=true
+            elseif mk:sub(1,9)=="cMaterial" and not mk:find("财富宝钻",1,true) then
+              wantReveal=true
+            end
+          end
+          if not wantReveal then
+            local lnb=("DRG skip-nonbasic mk=%s"):format(tostring(mk))
+            if zprobeOnce("drg",lnb) then zprobe(lnb) end
+            return
+          end
+          local target=nil
+          if mk~=nil then
+            for mi=1,#rows do if keys[mi]==mk then target=mi break end end
+          end
+          if target==nil then
+            local okP,pk=pcall(function() return binding.pack(bridge,packName) end)
+            if okP and pk~=nil then
+              local okD,dg=pcall(function() return pk:_get_drag_panel() end)
+              if okD and dg~=nil then
+                local ev=dg._drag_event
+                if type(ev)=="table" then
+                  local uid=nil
+                  for _,f in ipairs({"uid","item_uid","equip_uid","UniqueID"}) do
+                    pcall(function() if ev[f]~=nil then uid=tostring(ev[f]) end end)
+                    if uid~=nil then break end
+                  end
+                  if uid~=nil then
+                    for mi=1,#rows do
+                      if tostring(rows[mi].item.UniqueID)==uid then target=mi mk=keys[mi] how="event" break end
+                    end
+                  end
+                end
+              end
+            end
+          end
+          if target==nil then
+            local ln0=("DRG none mk=%s how=%s"):format(tostring(hoverKey),tostring(how))
+            if zprobeOnce("drg",ln0) then zprobe(ln0) end
+            return
+          end
+          -- 一次拖动只放一个副本：按住不放时不要每拍再放一个，否则会一组组全展开
+          if dragRevealKey==mk then
+            local lns=("DRG skip mk=%s"):format(tostring(mk))
+            if zprobeOnce("drg",lns) then zprobe(lns) end
+            return
+          end
+          local done=false
+          -- 找到该组当前可见的那一格，把分出来的副本排到它后面，位置上就挨在一起
+          local keeperIdx,keeperName=nil,nil
+          pcall(function() keeperName=tostring(rows[target].item.Name) end)
+          for mi=1,#rows do
+            if keys[mi]==mk then
+              local mtk=rows[mi].transform
+              if mtk~=nil then
+                local slk=slotOf(mtk)
+                if slk~=nil and slk.gameObject.activeSelf==true then
+                  keeperIdx=slk:GetSiblingIndex()
+                  break
+                end
+              end
+            end
+          end
+          -- 副本候选：同组 + 同名字 + 当前隐藏；优先挑离代表格最近的那一格。
+          -- 隐藏格子是游戏复用的池子，随便挑一格激活可能还是上一次的画（红钻位置冒出蓝钻）。
+          local bestIdx,bestDist=nil,nil
+          for mi=1,#rows do
+            if keys[mi]==mk and mi~=target then
+              local sameName=true
+              if keeperName~=nil then
+                local rn=nil
+                pcall(function() rn=tostring(rows[mi].item.Name) end)
+                sameName=(rn==keeperName)
+              end
+              if sameName then
+                local mt=rows[mi].transform
+                if mt~=nil then
+                  local slot=slotOf(mt)
+                  if slot~=nil and slot.gameObject.activeSelf~=true then
+                    local sib=slot:GetSiblingIndex()
+                    local dist=sib
+                    if keeperIdx~=nil then dist=math.abs(sib-keeperIdx) end
+                    if bestDist==nil or dist<bestDist then bestDist=dist bestIdx=mi end
+                  end
+                end
+              end
+            end
+          end
+          local rvName="-"
+          -- 优先用「我们自己隐藏过的那一格」：它一定是同组同一件，
+          -- 不存在复用池里残留旧画面的问题。
+          local rslot=hiddenSlotOf[mk]
+          if rslot~=nil then
+            local okAlive,go=pcall(function() return rslot.gameObject end)
+            if not okAlive or go==nil or go.activeSelf==true then rslot=nil else rvName="cached" end
+          end
+          if rslot==nil and bestIdx~=nil then
+            pcall(function() rvName=tostring(rows[bestIdx].item.Name) end)
+            rslot=slotOf(rows[bestIdx].transform)
+          end
+          if rslot~=nil then
+            rslot.gameObject:SetActive(true)
+            softHide(rslot.gameObject,false)
+            if keeperIdx~=nil then
+              pcall(function() rslot:SetSiblingIndex(keeperIdx+1) end)
+            end
+            done=true
+          end
+          if done then
+            dragRevealKey=mk
+            local crd=ctd.gameObject:GetComponent(rectType)
+            if crd~=nil then U.UI.LayoutRebuilder.ForceRebuildLayoutImmediate(crd) end
+          end
+          if done or zprobeOnce("drg",tostring(mk))~=nil then
+            zprobe(("DRG mk=%s done=%s keeper=%s keepName=%s rv=%s rvName=%s how=%s"):format(tostring(mk),tostring(done),tostring(keeperIdx),tostring(keeperName),tostring(bestIdx),tostring(rvName),tostring(how)))
+          end
+        end)
       end
-    end
-    local degraded=false
-    for _,rec in pairs(desired) do
-      local g=rec.group
-      if g~=nil and g.degraded then
-        -- This stack is already expanded for this frame.
-      elseif not conceal(rec) then
-        -- Unobservable slot: expand its whole stack and leave the others alone.
-        if g~=nil then
-          g.degraded=true
-          for id,own in pairs(hidden) do
-            if own.group==g then pcall(release,id) end
+    else
+      dragRevealKey=nil
+      local ct=equipTr:Find("ScrollView/Viewport/Content")
+      if ct~=nil then
+        local cid=ct.gameObject:GetInstanceID()
+        local function slotOf(tr)
+          local t=tr
+          while t~=nil do
+            local p=t.parent
+            if p==nil then break end
+            if p.gameObject:GetInstanceID()==cid then return t end
+            t=p
+          end
+          return nil
+        end
+        -- 面板重建后，pack 里的槽位引用可能指向旧对象，而界面显示的是新对象；
+        -- 这时按 Content 子物体顺序对齐（实测 si = idx + offset，offset 通常为 2）。
+        local offTally,offset={},2
+        for mi=1,#rows do
+          local mt0=rows[mi].transform
+          if mt0~=nil then
+            local s0=slotOf(mt0)
+            if s0~=nil then
+              local d=s0:GetSiblingIndex()-(mi-1)
+              offTally[d]=(offTally[d] or 0)+1
+            end
           end
         end
-        degraded=true
+        do
+          local best=0
+          for d,cnt in pairs(offTally) do
+            if cnt>best then best=cnt offset=d end
+          end
+        end
+        local groups,order={},{}
+        local fbCount,mappedCount=0,0
+        local restoredAny=false
+        for mi=1,#rows do
+          local mt=rows[mi].transform
+          local slot=nil
+          if mt~=nil then slot=slotOf(mt) end
+          if slot~=nil then mappedCount=mappedCount+1 end
+          if slot==nil then
+            local ci=mi-1+offset
+            local okc,ch=pcall(function() return ct:GetChild(ci) end)
+            if okc and ch~=nil then slot=ch fbCount=fbCount+1 end
+          end
+          if slot~=nil then
+            local mk=keys[mi]
+            local g=groups[mk]
+            if g==nil then g={} groups[mk]=g order[#order+1]=mk end
+            g[#g+1]={idx=mi,slot=slot}
+          end
+        end
+        curMapped,curFb=mappedCount,fbCount
+        local recs,any={},false
+        local reps={}
+        for _,mk in ipairs(order) do
+          local g=groups[mk]
+          local prev=repByKey[mk]
+          local keeper,found=nil,false
+          if prev~=nil then
+            for _,entry in ipairs(g) do
+              if entry.slot.gameObject:GetInstanceID()==prev then keeper=entry.slot found=true break end
+            end
+          end
+          if not found then keeper=g[1].slot end
+          reps[mk]=keeper and keeper.gameObject:GetInstanceID() or nil
+          for _,entry in ipairs(g) do
+            recs[#recs+1]={slot=entry.slot}
+            local keep=(entry.slot==keeper)
+            if entry.slot.gameObject.activeSelf~=keep then
+              if keep then
+                entry.slot.gameObject:SetActive(true)
+                softHide(entry.slot.gameObject,false)
+              else
+                softHide(entry.slot.gameObject,true)
+                entry.slot.gameObject:SetActive(false)
+                hiddenSlotOf[mk]=entry.slot
+              end
+              any=true
+            end
+          end
+        end
+        do
+          local okm,mp=pcall(function() return U.Input.mousePosition end)
+          if okm and mp~=nil then
+            local cam=nil
+            pcall(function()
+              local cnv=viewport.gameObject:GetComponentInParent(typeof(U.Canvas))
+              if cnv~=nil then cam=cnv.worldCamera end
+            end)
+            do
+              for mi=1,#rows do
+                local mt=rows[mi].transform
+                local slot=nil
+                if mt~=nil then slot=slotOf(mt) end
+                -- 只认当前真正显示的格子：被我们隐藏的格子还留着旧坐标，
+                -- 列表重排后它的旧矩形可能正好压在别的格子上，会认错组（红钻→蓝钻）。
+                if slot~=nil and slot.gameObject.activeSelf==true then
+                  local rr=nil
+                  pcall(function() rr=slot.gameObject:GetComponent(rectType) end)
+                  if rr~=nil then
+                    local c1=U.RectTransformUtility.WorldToScreenPoint(cam,rr:TransformPoint(U.Vector3(rr.rect.xMin,rr.rect.yMin,0)))
+                    local c2=U.RectTransformUtility.WorldToScreenPoint(cam,rr:TransformPoint(U.Vector3(rr.rect.xMax,rr.rect.yMax,0)))
+                    local xmin,xmax=math.min(c1.x,c2.x),math.max(c1.x,c2.x)
+                    local ymin,ymax=math.min(c1.y,c2.y),math.max(c1.y,c2.y)
+                    if mp.x>=xmin and mp.x<=xmax and mp.y>=ymin and mp.y<=ymax then
+                      hoverKey=keys[mi] break
+                    end
+                  end
+                end
+              end
+            end
+          end
+        end
+
+        if zprobeOnce("hv",tostring(hoverKey)) then zprobe("HV "..tostring(hoverKey)) end
+        repByKey=reps
+        lastSlots=recs
+        do
+          local okP,pk=pcall(function() return binding.pack(bridge,packName) end)
+          if okP and pk~=nil then
+            local ks={}
+            local okT=pcall(function()
+              for k,v in pairs(pk) do
+                local n=tostring(k)
+                local tv=type(v)
+                if tv=="table" or tv=="function" or n:find("drag") or n:find("item") or n:find("Item") then
+                  ks[#ks+1]=n..":"..tv
+                end
+              end
+            end)
+            table.sort(ks)
+            local ln="PK "..table.concat(ks,",")
+            if #ln>900 then ln=ln:sub(1,900) end
+            if zprobeOnce("pkkeys",ln) then zprobe(ln) end
+            local okD,dg=pcall(function() return pk:_get_drag_panel() end)
+            if okD and dg~=nil and type(dg)=="table" then
+              local ks2={}
+              for k,v in pairs(dg) do
+                ks2[#ks2+1]=tostring(k)..":"..type(v)
+              end
+              table.sort(ks2)
+              local ln2="DK "..table.concat(ks2,",")
+              if #ln2>700 then ln2=ln2:sub(1,700) end
+              if zprobeOnce("dkkeys",ln2) then zprobe(ln2) end
+              do
+                local ev=dg._drag_event
+                if type(ev)=="table" then
+                  local parts={}
+                  for k,v in pairs(ev) do
+                    local tv=type(v)
+                    local sv=tostring(v)
+                    if #sv>40 then sv=sv:sub(1,40).."..." end
+                    parts[#parts+1]=tostring(k).."("..tv..")="..sv
+                  end
+                  table.sort(parts)
+                  local ln3="DE "..table.concat(parts," ; ")
+                  if #ln3>800 then ln3=ln3:sub(1,800) end
+                  if zprobeOnce("dekeys",ln3) then zprobe(ln3) end
+                else
+                  if zprobeOnce("dekeys","DE nottable:"..type(dg._drag_event)) then zprobe("DE nottable:"..type(dg._drag_event)) end
+                end
+              end
+            end
+          end
+        end
+        if restoredAny then
+          local cr2=ct.gameObject:GetComponent(rectType)
+          if cr2~=nil then pcall(function() U.UI.LayoutRebuilder.ForceRebuildLayoutImmediate(cr2) end) end
+        end        do
+          local hid2=0
+          for _,rec in ipairs(recs) do
+            if rec.slot~=nil and rec.slot.gameObject~=nil and rec.slot.gameObject.activeSelf~=true then hid2=hid2+1 end
+          end
+          if __pr.last.hid~=hid2 then
+            __pr.last.hid=hid2
+            zprobe(("HCHG hidden=%d groups=%d rows=%d"):format(hid2,#order,#rows))
+          end
+        end        if any then
+          local cr=ct.gameObject:GetComponent(rectType)
+          if cr~=nil then pcall(function() U.UI.LayoutRebuilder.ForceRebuildLayoutImmediate(cr) end) end
+        end
       end
-      if check~=epoch then return end
     end
-    if degraded then hide("slot not observable") end
-    if dragging then hide("dragging; one extra slot per stack") end
-    if layoutDirty then
-      hide("waiting for layout")
-      rebuild()
-      return
-    end
-    if dragging then return end
+    if waiting then hide("inventory changing") return end
+    local vr=viewport.rect
+    if vr.width<=0 or vr.height<=0 then hide("waiting for viewport") return end
     local publish={}
     for i,row in ipairs(rows) do
-      publish[i]={itemId=row.itemId,groupKey=keys[i],anchor=edge(row.transform,vr)}
+      publish[i]={itemId=row.itemId,groupKey=keys[i],anchor=locate(row.transform,vr)}
     end
+
     if samePlacement(placements,publish) then return end
     local token=layer:invalidate()
     placements=nil
     local ok,count=layer:publish(token,publish)
     if ok then
       placements=publish
-      local hid,retry=0,0
-      for _,rec in pairs(hidden) do
-        hid=hid+1
-        local tries=rec.restoreTries or 0
-        if tries>retry then retry=tries end
+      local consInfo=""
+      if state and state.badgeCons~=nil then
+        consInfo=" | cons: "..tostring(state.badgeCons.status)
       end
-      result.status=("badge preview: backpack=%d badges=%d eligible=%d excluded=%s hidden=%d retry=%d"):format(#rows,count,eligible,exclusions,hid,retry)
+      result.status=("badge preview: backpack=%d badges=%d eligible=%d excluded=%s"):format(#rows,count,eligible,exclusions)..consInfo
     end
   end
 
   onStart=function()
     if disposed then return end
     waiting=true
-    pcall(discard,"inventory changing")
+    catalog,keys=nil,nil
+    pcall(hide,"inventory changing")
   end
   onDone=function()
     if disposed then return end
     waiting=false
-    pcall(discard,"waiting for stable bindings")
+    catalog,keys=nil,nil
+    pcall(hide,"waiting for stable bindings")
   end
   function result:invalidate()
     if disposed then return end
-    discard("waiting for stable bindings")
+    catalog,keys=nil,nil
+    hide("waiting for stable bindings")
   end
   function result:dispose()
     if disposed then return end
+    pcall(restoreLast)
     disposed=true
     if subscribedStart then pcall(function() notify.remove_notify_handler(group,start,onStart,owner) end) end
     if subscribedDone then pcall(function() notify.remove_notify_handler(group,done,onDone,owner) end) end
     if scroll~=nil then pcall(function() scroll.onValueChanged:RemoveListener(onScroll) end) end
     if ticker~=nil then pcall(function() ticker:ClearLateTickCallback() end) end
-    pcall(discard,"disposed")
-    pcall(rebuild)
     if layer~=nil then pcall(function() layer:dispose() end) end
     if tickerGo~=nil then pcall(U.Object.Destroy,tickerGo) end
   end
@@ -697,17 +966,21 @@ function M.new(bridge,G,equipTr,viewport,binding,equiv,badges)
   local ok,initFail=pcall(function()
     layer=badges.new(U,viewport)
     tickerGo=U.GameObject("WDHO_StackBadgeTicker")
-    tickerGo.transform:SetParent(equipTr,false)
+    -- 挂在 EquipBackpack 而不是 EquipList：列表重建时 ticker 不会被一起销毁
+    tickerGo.transform:SetParent(equipTr.parent or equipTr,false)
     ticker=assert(tickerGo:AddComponent(typeof(bridge.RPG.Client.MonoPerformanceUITransfer)))
     local tickFrame=0
+    local depth=0
     ticker:SetLateTickCallback(function()
+      depth=depth+1
+      result.tickCount=depth
       if disposed or checking then return end
       tickFrame=(tickFrame+1)%3
       if tickFrame~=0 then return end
       checking=true
       local good=pcall(tick)
       checking=false
-      if not good then pcall(discard,"binding or raw properties unavailable") pcall(rebuild) end
+      if not good then catalog,keys=nil,nil pcall(hide,"binding or raw properties unavailable") end
     end,owner)
     subscribedStart=true
     notify.add_notify_handler(group,start,onStart,owner)
@@ -731,8 +1004,8 @@ end
 return M
 
 end)()
-local function __equipbar_badge_preview(bridge,G,equipTr,viewport)
-  return EquipBadgeRuntime.new(bridge,G,equipTr,viewport,EquipBinding,EquipEquivalence,StackBadgeLayer)
+local function __equipbar_badge_preview(bridge,G,equipTr,viewport,packName)
+  return EquipBadgeRuntime.new(bridge,G,equipTr,viewport,EquipBinding,EquipEquivalence,StackBadgeLayer,packName)
 end
 local bridge=CS
 if bridge==nil then return "wait unity" end
@@ -744,9 +1017,15 @@ if U==nil then return "wait unity" end
 local PC="UIRoot/Page/GridFightS2TeamEditPage(Clone)/Root/PanelContent"
 local state=_G.Q_EQUIP_STATE
 local function disposeBadge()
+  if state~=nil and state.badgeCons~=nil then
+    local runningC=state.badgeCons
+    state.badgeCons,state.badgeConsRevision,state.badgeConsViewport=nil,nil,nil
+    pcall(function() runningC:dispose() end)
+  end
   if state~=nil and state.badge~=nil then
     local running=state.badge
-    state.badge,state.badgeRevision,state.badgeEquip,state.badgeViewport=nil,nil,nil,nil
+    state.badge,state.badgeRevision,state.badgeEquip=nil,nil,nil
+    state.badgeTC,state.badgeTCAt=nil,nil
     running:dispose()
   end
 end
@@ -760,34 +1039,145 @@ local id=pc:GetInstanceID()
 local revision=__equipbar_revision or 0
 if state==nil or state.panel~=id then
   disposeBadge()
+  local keepEq=state and state.equipWanted
+  local keepCons=state and state.consWanted
   state={panel=id}
+  state.equipWanted,state.consWanted=keepEq,keepCons
   _G.Q_EQUIP_STATE=state
 end
 
+local bpTrDump=pc.transform:Find("EquipBackpack")
+if _G.Q_EQUIP_DUMPED==nil then
+  _G.Q_EQUIP_DUMPED=true
+  pcall(function()
+    local page=bridge.RPG.Client.GlobalVars.s_UIManager:GetPageByName("GridFightPreparationPage")
+    local binder=page and page.LuaTable and page.LuaTable._binder
+    local pack=binder and binder.panel_equip_item_pack
+    if pack==nil then zprobe("DUMP no pack") return end
+    local names={}
+    local okType=pcall(function()
+      local t=pack:GetType()
+      local ms=t:GetMethods()
+      local n=0
+      local len=(type(ms.Length)=="number") and ms.Length or 0
+      for i=0,len-1 do
+        local nm=ms[i] and ms[i].Name
+        if nm~=nil then n=n+1 if n<=110 then names[#names+1]=nm end end
+      end
+      names[#names+1]="COUNT="..tostring(n)
+    end)
+    if not okType then
+      local okIp=pcall(function()
+        local n=0
+        for _,mi in ipairs(pack:GetType():GetMethods()) do
+          local nm=mi.Name
+          n=n+1
+          if n<=110 then names[#names+1]=nm end
+        end
+        names[#names+1]="COUNT="..tostring(n)
+      end)
+      if not okIp then names[#names+1]="reflect fail" end
+    end
+    zprobe("DUMP "..table.concat(names,","))
+  end)
+end
 local bpTr=pc.transform:Find("EquipBackpack")
-if bpTr==nil then disposeBadge() return "wait bp" end
+if bpTr==nil then return "wait bp" end
 local eqTr=bpTr:Find("EquipList")
 local consTr=bpTr:Find("ConsumableList")
-if eqTr==nil or consTr==nil then disposeBadge() return "wait lists" end
+if eqTr==nil or consTr==nil then return "wait lists" end
 local bp=bpTr.gameObject
 local equip,consumables=eqTr.gameObject,consTr.gameObject
-local backpackId,equipId,consumablesId=bp:GetInstanceID(),equip:GetInstanceID(),consumables:GetInstanceID()
-local viewport=eqTr:Find("ScrollView/Viewport")
-local viewportId=viewport and viewport.gameObject:GetInstanceID()
-if state.badge~=nil and
-    (state.badgeRevision~=revision or state.badgeEquip~=equipId or state.badgeViewport~=viewportId) then
-  disposeBadge()
+-- 复制角色/领晶矿后游戏会把列表重新激活，用户手动关掉过的要保持关闭
+-- 整条栏的软隐藏：除了 SetActive，还把 CanvasGroup 透明度压 0。
+-- 游戏重新激活列表时，alpha 仍是 0，所以不会再闪一下整排装备。
+local function softBar(go,on)
+  pcall(function()
+    local cg=go:GetComponent(typeof(U.CanvasGroup))
+    if cg==nil then cg=go:AddComponent(typeof(U.CanvasGroup)) end
+    if on then
+      cg.alpha=0
+      cg.blocksRaycasts=false
+      cg.interactable=false
+    else
+      cg.alpha=1
+      cg.blocksRaycasts=true
+      cg.interactable=true
+    end
+  end)
 end
+-- 折叠整块区域但不 SetActive：用 LayoutElement.ignoreLayout 让它不参与父级排版，
+-- 这样游戏把对象重新激活时不会引起整条栏重新排版（就是那一下「跳动」）。
+local function barCollapse(go,on)
+  pcall(function()
+    local le=go:GetComponent(typeof(U.UI.LayoutElement))
+    if le==nil then le=go:AddComponent(typeof(U.UI.LayoutElement)) end
+    -- 隐藏时 ignoreLayout=true 并且 SetActive(false)：不占位、不进排版。
+    -- 游戏事后把它重新激活，因为 ignoreLayout 仍是 true，也不会引起排版跳动。
+    le.ignoreLayout=on==true
+  end)
+  softBar(go,on)
+  pcall(function()
+    go:SetActive(on~=true)
+    if on~=true then
+      local pr=go.transform.parent
+      local prr=pr and pr:GetComponent(typeof(U.RectTransform))
+      if prr~=nil then U.UI.LayoutRebuilder.ForceRebuildLayoutImmediate(prr) end
+    end
+  end)
+end
+if state~=nil and state.consWanted==nil then
+  pcall(function()
+    local cg0=consumables:GetComponent(typeof(U.CanvasGroup))
+    if cg0~=nil and cg0.alpha<0.5 then barCollapse(consumables,false) end
+  end)
+end
+if state~=nil then
+  if state.equipWanted==false then
+    if state.badge~=nil then pcall(state.badge.suppress,state.badge,true) end
+    if equip.activeSelf==true then
+    softBar(equip,true)
+    equip:SetActive(false)
+    state.rehideEq=(state.rehideEq or 0)+1
+    end
+  end
+  if state.consWanted==false then
+    barCollapse(consumables,true)
+    state.rehideCons=(state.rehideCons or 0)+1
+  end
+end
+local backpackId,equipId,consumablesId=bp:GetInstanceID(),equip:GetInstanceID(),consumables:GetInstanceID()
 local function status()
+  if state.badge~=nil and
+      (__equipbar_badge_preview==nil or state.badgeRevision~=revision or state.badgeEquip~=equipId) then
+    disposeBadge()
+  end
+  -- 看门狗：面板重建会连 ticker 一起销毁，而 state.badge 还挂着旧引用，
+  -- 隐藏/角标就全部停摆（表现就是「一操作就全展开」）。tick 计数不涨就重建。
+  if state.badge~=nil then
+    local nowT=os.time()
+    local tc=state.badge.tickCount
+    if tc~=nil and tc~=state.badgeTC then
+      state.badgeTC=tc
+      state.badgeTCAt=nowT
+    elseif type(state.badgeTCAt)=="number" and nowT-state.badgeTCAt>2 then
+      disposeBadge()
+    end
+  end
   if __equipbar_badge_preview~=nil then
+    -- 角标画在面板根上：蓝钻/财富宝钻那些格子在 EquipList 的 rect 之外，
+    -- 用列表坐标系永远算不出合法锚点，改用覆盖整块面板的根节点。
+    local viewport=pc.transform
     if viewport==nil then disposeBadge() return "badge preview: waiting for viewport" end
+    if state.badge~=nil and state.badgeViewport~=viewport.gameObject:GetInstanceID() then disposeBadge() end
     if state.badge==nil then
       local ok,new,reason=pcall(__equipbar_badge_preview,bridge,G,eqTr,viewport)
       if not ok then return "badge preview: stock UI notifications or ticker unavailable" end
       if new==nil then return reason end
       state.badge,state.badgeRevision,state.badgeEquip=new,revision,equipId
-      state.badgeViewport=viewportId
-    end
+      state.badgeViewport=viewport.gameObject:GetInstanceID()
+    end    local zt=zprobeDrain()
+    if zt~="" then return state.badge.status.."\n"..zt end
     return state.badge.status
   end
   if __equipbar_binding_preview~=nil and equip.activeSelf then
@@ -943,8 +1333,18 @@ local ok,err=pcall(function()
     if d.button==left then
       if state.badge~=nil then pcall(state.badge.invalidate,state.badge) end
       equip:SetActive(not equip.activeSelf)
+      softBar(equip,not equip.activeSelf)
+      state.equipWanted=equip.activeSelf
+      if state.badge~=nil and state.badge.suppress~=nil then
+        pcall(state.badge.suppress,state.badge,state.equipWanted==false)
+      end
     elseif d.button==right then
-      consumables:SetActive(not consumables.activeSelf)
+      zprobe(("RCLICK supp=%s vanilla=%s"):format(tostring(state.rSuppressClick),tostring(state.vanilla)))
+      if state.rSuppressClick==true then state.rSuppressClick=false return end
+      local cgC=consumables:GetComponent(typeof(U.CanvasGroup))
+      local visibleC=(consumables.activeSelf==true) and (cgC==nil or cgC.alpha>0.5)
+      barCollapse(consumables,visibleC)
+      state.consWanted=not visibleC
     else
       return
     end
@@ -990,6 +1390,49 @@ local ok,err=pcall(function()
   bind(ids.PointerClick,toggle)
   if tg.triggers.Count~=4 then error("incomplete button listeners") end
   syncIndicators()
+
+  -- 长按右键（约 0.6 秒）在「mod 接管」和「游戏原生」之间切换：
+  -- 原生模式下按钮不再拦截点击（raycastTarget=false），右键交回游戏自己处理。
+  local function applyVanilla()
+    local on=(state.vanilla==true)
+    pcall(function()
+      face.color=on and U.Color(1,1,1,0.4) or U.Color(1,1,1,0.75)
+    end)
+  end
+  applyVanilla()
+  local rHeldAt=nil
+  state.onFrame=function()
+    local now=0
+    pcall(function() now=U.Time.realtimeSinceStartup end)
+    local okH,held=pcall(function() return U.Input.GetMouseButton(1) end)
+    held=(okH and held==true)
+    if held then
+      if rHeldAt==nil then
+        rHeldAt=now
+        state.rLongFired=false
+        zprobe(("RCD %.2f"):format(now))
+      elseif state.rLongFired~=true and (now-rHeldAt)>=1.0 then
+        -- 按住到 0.6 秒就立刻切换：这时还没松手，PointerClick 还没触发，
+        -- 抑制标记可以先设好，松手时那次点击就会被吞掉。
+        state.rLongFired=true
+        state.vanilla=not (state.vanilla==true)
+        state.rSuppressClick=true
+        state.rSuppressAt=now
+        applyVanilla()
+        zprobe(("RCLONG %.2f dur=%.2f vanilla=%s"):format(now,now-rHeldAt,tostring(state.vanilla)))
+      end
+    else
+      if rHeldAt~=nil then
+        rHeldAt=nil
+        state.rReleaseAt=now
+        zprobe(("RCU %.2f"):format(now))
+      end
+      -- 只从「松手之后」开始计时清除，按住多久都不会提前清掉抑制标记
+      if state.rSuppressClick==true and state.rReleaseAt~=nil and (now-state.rReleaseAt)>0.8 then
+        state.rSuppressClick=false
+      end
+    end
+  end
   btn:SetActive(true)
   if not btn.activeSelf then error("button activation failed") end
   state.button,state.backpack=buttonId,backpackId

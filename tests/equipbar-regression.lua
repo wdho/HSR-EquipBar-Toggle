@@ -39,6 +39,15 @@ local function object(name)
     assert(parent.children[name]==nil,"duplicate child: "..name)
     parent.children[name]=self
     self.parent=parent
+    parent.childCount=(parent.childCount or 0)+1
+  end
+  function tr:GetChild(i)
+    local n=0
+    for _,c in pairs(self.children) do
+      if n==i then return c end
+      n=n+1
+    end
+    return nil
   end
   function tr:SetAsLastSibling() end
   function tr:IsChildOf(parent)
@@ -339,6 +348,14 @@ local function fixture()
   function fx:layer()
     return assert(v.transform:Find("WDHO_StackBadgeLayer")).gameObject
   end
+  -- What the game does on a long press: it activates its own upgrade / privilege
+  -- preview inside the equipment tree, without adding an _equip_items row.
+  function fx:addPreview()
+    local node=object("UpgradePreview")
+    node.transform:SetParent(equip.transform)
+    node:AddComponent("Rect")
+    return node
+  end
   function fx:step()
     local ticker=self:ticker()
     -- Keep interested in the observable state, not an implementation's frame cadence.
@@ -366,6 +383,14 @@ fx.dragging=true
 fx:step()
 assert(fx:visible()==2,"drag: exactly one additional distinct physical slot")
 fx:assertNativeHidden()
+-- Long press without moving: the game activates its upgrade preview in the
+-- equipment tree while the list is held.  The plugin must not hide that node,
+-- and it must not take the stack back down to one slot on that frame.
+local preview=fx:addPreview()
+fx:step()
+assert(preview.activeSelf,"long-press: the upgrade preview must stay visible")
+assert(fx:visible()==2,"long-press: the dragged stack keeps its second slot")
+preview:SetActive(false)
 fx.dragging=false
 fx:step()
 assert(fx:visible()==1 and fx:layer().activeSelf,"drop: collapse again")
