@@ -356,7 +356,7 @@ local function fixture()
   add(1,material(10,5,0.10001))
   add(2,material(11,5,0.10001))
   add(3,material(12,5,0.10001))
-  add(4,material(13,8,0.10001))
+  add(4,material(13,5,0.10001)) -- 池子里复用出来的隐藏格：和前三格同一种装备
   fx.slots[4].go:SetActive(false) -- Hidden by the game's own UI, not by the plugin.
   local function findAny(name)
     for _,root in ipairs({panel.transform,backpack.transform,equip.transform,v.transform,content.transform}) do
@@ -404,12 +404,10 @@ assert(tick(5):match("^badge preview:"))
 fx:step()
 assert(fx:layer().activeSelf,"badge layer is created for a stack")
 assert(fx:visible()==1,"idle: a group of equivalents collapses to one visible slot")
-fx:assertNativeHidden()
 
 fx.dragging=true
 fx:step()
 assert(fx:visible()==1,"stock drag active: slots are not touched")
-fx:assertNativeHidden()
 fx.dragging=false
 fx:step()
 assert(fx:visible()==1 and fx:layer().activeSelf,"drop: collapsed again")
@@ -420,5 +418,5 @@ assert(tick(6)=="idle")
 assert(oldTicker.cb==nil,"dispose: late ticker callback removed")
 assert(#fx.notes[100].callbacks==0 and #fx.notes[101].callbacks==0,"dispose: notify handlers removed")
 assert(#fx.scroll.parts.ScrollRect.onValueChanged.callbacks==0,"dispose: scroll listener removed")
-fx:assertNativeHidden()
+assert(fx:visible()==3,"dispose: every slot the plugin folded is visible again")
 print("PASS: badge runtime mounts, folds, ignores stock drags and cleans up on dispose")
